@@ -2,7 +2,9 @@
 
 一份从零讲到大模型完整推理过程的单文件图文教程，所有"逐层演算"的数字都来自本地真实训练的小模型。
 
-**打开方式**：直接双击 `index.html`（单文件、离线、无外部依赖）。
+**在线阅读**：[xipinggg.github.io/llm-from-scratch](https://xipinggg.github.io/llm-from-scratch/)（Markdown 版静态站点，27 章）
+
+**离线阅读**：直接双击 `index.html`（单文件、离线、无外部依赖，含 10 个可交互演示）
 
 ## 内容结构（27 章，含第 0 章导言、四章附录与一章前沿）
 
