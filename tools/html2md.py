@@ -489,12 +489,18 @@ class Renderer:
 
     def figure(self, n):
         cap = ""
+        has_svg = False
         for c in n.children:
             if isinstance(c, str):
                 continue
             if c.tag == "figcaption":
                 cap = self.inline_children(c)
+            elif "figbox" in cls(c):
+                has_svg = True
+        if has_svg:
+            cap = cap + "（示意图见 HTML 版）"
         if cap:
+            cap = cap.replace("**", "")
             self.out.append("*" + cap + "*")
             self.out.append("")
 
@@ -603,7 +609,7 @@ def main():
 
     # 目录
     book = ["# 大模型是怎么想出一个字的", "",
-            "一份从零讲到大模型完整推理过程的单文件教程的 **Markdown 版**。所有“逐层演算”的数字都来自本地真实训练的小模型（2 层、宽度 8、1608 个参数），固定种子可复现；交互演示只存在于 HTML 版。", "",
+            "一份从零讲到大模型完整推理过程的单文件教程的 **Markdown 版**。所有“逐层演算”的数字都来自本地真实训练的小模型（2 层、宽度 8、1608 个参数），固定种子可复现；示意图与交互演示只存在于 HTML 版。", "",
             "> 完整版是仓库根目录的 `index.html`（离线单文件，含 10 个可交互演示）。本目录是方便阅读、检索与引用而生成的纯文本版。", "",
             "## 目录", "", "| 章 | 标题 | 简介 |", "| --- | --- | --- |"]
     for num, title, desc, outname, _ in metas:
