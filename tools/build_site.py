@@ -50,7 +50,12 @@ def extract_math(text):
 def inline(text):
     text = html.escape(text, quote=False)
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>', text)
+    def _link(m):
+        label, href = m.group(1), m.group(2)
+        if href.endswith(".md") and not href.startswith(("http://", "https://", "mailto:")):
+            href = "index.html" if href.split("/")[-1].lower() == "readme.md" else href[:-3] + ".html"
+        return f'<a href="{href}">{label}</a>'
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", _link, text)
     text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
     text = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", text)
 
