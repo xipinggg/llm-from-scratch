@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>目录 · 大模型是怎么想出一个字的</title>
+<link rel="stylesheet" href="katex.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav>
+  <div class="brand">LLM · From Scratch</div>
+  <a href="index.html" class="on">目录与说明</a>
+  <a href="00-hero.html">00 · 怎么读这份材料</a>
+  <a href="01-overview.html">01 · 全景：一次推理的七个阶段</a>
+  <a href="02-math.html">02 · 必备数学：只有六件事</a>
+  <a href="03-tokenizer.html">03 · 分词：把文字变成整数</a>
+  <a href="04-embedding.html">04 · 嵌入：把整数变成向量</a>
+  <a href="05-attention.html">05 · 注意力：20 个位置怎么互相看</a>
+  <a href="06-residual-norm.html">06 · 残差与归一化：让 96 层也能训</a>
+  <a href="07-ffn.html">07 · 前馈网络：模型把知识存在哪</a>
+  <a href="08-forward-pass.html">08 · 完整前向：从字符到概率</a>
+  <a href="09-sampling.html">09 · 选哪个字：温度、top-k、top-p</a>
+  <a href="10-inference-engine.html">10 · 推理引擎：把 FLOPs 变成毫秒</a>
+  <a href="11-kv-cache.html">11 · KV cache：显存、带宽与并发</a>
+  <a href="12-serving-params.html">12 · 服务参数：vLLM 与 SGLang 调参</a>
+  <a href="13-gpu.html">13 · GPU 执行：一次 decode 是怎么落到硬件上的</a>
+  <a href="14-quant-spec.html">14 · 推理加速：量化、投机解码与约束解码</a>
+  <a href="15-long-context.html">15 · 长上下文：位置外推、KV 压缩与 1M 的账</a>
+  <a href="16-arch-variants.html">16 · 架构变体：MoE、MLA、Mamba 与 MTP</a>
+  <a href="17-training.html">17 · 训练：从下一个字到对齐人类</a>
+  <a href="18-reasoning.html">18 · 推理模型：让模型多想一想</a>
+  <a href="19-implement.html">19 · 从零实现：200 行 numpy</a>
+  <a href="20-agent.html">20 · Agent：让模型动手做事</a>
+  <a href="21-harness.html">21 · Harness：模型外面那一圈代码</a>
+  <a href="22-scale-faq.html">22 · 规模地图与常见误解</a>
+  <a href="23-exercises.html">23 · 习题与动手实验</a>
+  <a href="24-glossary.html">24 · 术语表</a>
+  <a href="25-source-reading.html">25 · 源码导读：读一个真实的注意力 kernel</a>
+  <a href="26-research-frontier.html">26 · 研究前沿：推理引擎正在往哪走</a>
+  <a href="book.html">合集（单页）</a>
+</nav>
+<main>
+  <div class="crumb">目录</div>
+  <h1>大模型是怎么想出一个字的</h1>
+<p>一份从零讲到大模型完整推理过程的单文件教程的 <strong>Markdown 版</strong>。所有“逐层演算”的数字都来自本地真实训练的小模型（2 层、宽度 8、1608 个参数），固定种子可复现；示意图与交互演示只存在于 HTML 版。</p>
+<blockquote><p>完整版是仓库根目录的 <code>index.html</code>（离线单文件，含 10 个可交互演示）。本目录是方便阅读、检索与引用而生成的纯文本版。</p></blockquote>
+<h2>目录</h2>
+<div class="tablewrap"><table><thead><tr><th>章</th><th>标题</th><th>简介</th></tr></thead><tbody><tr><td>00</td><td><a href="00-hero.md">怎么读这份材料</a></td><td>四条阅读路线，以及材料背后的约定</td></tr><tr><td>01</td><td><a href="01-overview.md">全景：一次推理的七个阶段</a></td><td>从字符串到概率分布，先看完整流程再拆开</td></tr><tr><td>02</td><td><a href="02-math.md">必备数学：只有六件事</a></td><td>向量、点积、矩阵乘、softmax、交叉熵、梯度</td></tr><tr><td>03</td><td><a href="03-tokenizer.md">分词：把文字变成整数</a></td><td>BPE 如何切分世界，以及为什么它总被吐槽</td></tr><tr><td>04</td><td><a href="04-embedding.md">嵌入：把整数变成向量</a></td><td>查表、相加、以及位置信息为什么必须存在</td></tr><tr><td>05</td><td><a href="05-attention.md">注意力：20 个位置怎么互相看</a></td><td>Q/K/V、打分、softmax、加权求和、矩阵形式、四个头的实测分工与三种失效</td></tr><tr><td>06</td><td><a href="06-residual-norm.md">残差与归一化：让 96 层也能训</a></td><td>为什么加回去，为什么先归一化再进子层</td></tr><tr><td>07</td><td><a href="07-ffn.md">前馈网络：模型把知识存在哪</a></td><td>两层矩阵、一个非线性，占掉三分之二的参数</td></tr><tr><td>08</td><td><a href="08-forward-pass.md">完整前向：从字符到概率</a></td><td>20 个 token 穿过 2 层，最后落在 17 个候选上</td></tr><tr><td>09</td><td><a href="09-sampling.md">选哪个字：温度、top-k、top-p</a></td><td>从概率分布里抽样的全部工程细节</td></tr><tr><td>10</td><td><a href="10-inference-engine.md">推理引擎：把 FLOPs 变成毫秒</a></td><td>prefill 与 decode 各自动作、roofline、FlashAttention、量化、投机解码、连续批处理与混合批次</td></tr><tr><td>11</td><td><a href="11-kv-cache.md">KV cache：显存、带宽与并发</a></td><td>缓存的不变量与四条优化路线、GQA/MLA 与矩阵吸收、KV 量化、分页与前缀缓存、跨层共享、稀疏与 NSA、卸载到内存/磁盘、PD 分离、精度与安全、压缩与卸载计算器</td></tr><tr><td>12</td><td><a href="12-serving-params.md">服务参数：vLLM / SGLang 调参</a></td><td>显存预算、并发上限、调度预算、前缀缓存、抢占、并行、量化与排障</td></tr><tr><td>13</td><td><a href="13-gpu.md">GPU 执行：一次 decode 怎么落到硬件</a></td><td>调用栈、kernel 清单、注意力 kernel 与分页、显存与拷贝、CUDA graph、多卡通信、观测</td></tr><tr><td>14</td><td><a href="14-quant-spec.md">推理加速：量化、投机解码与约束解码</a></td><td>均匀量化的误差与粒度、GPTQ/AWQ/SmoothQuant/FP8、量化 kernel、投机解码与验证、grammar 掩码</td></tr><tr><td>15</td><td><a href="15-long-context.md">长上下文：位置外推、KV 压缩与 1M 的账</a></td><td>RoPE 外推（PI/NTK/YaRN）、滑窗与混合层、KV 淘汰与 MLA、prefill 的 O(T²)、检索与长上下文的取舍、评测</td></tr><tr><td>16</td><td><a href="16-arch-variants.md">架构变体：MoE、MLA、Mamba 与 MTP</a></td><td>混合专家路由与负载均衡、MLA 的低秩 KV、滑窗与线性注意力的取舍、多 token 预测、归一化与激活的演进，以及没有变的部分</td></tr><tr><td>17</td><td><a href="17-training.md">训练：从下一个字到对齐人类</a></td><td>预训练、缩放定律、SFT、RLHF、DPO、GRPO</td></tr><tr><td>18</td><td><a href="18-reasoning.md">推理模型：让模型多想一想</a></td><td>CoT、测试时计算缩放、PRM 与 MCTS、GRPO 细节、R1 配方、蒸馏</td></tr><tr><td>19</td><td><a href="19-implement.md">从零实现：200 行 numpy</a></td><td>前向、反向、Adam、训练与生成，完整可运行</td></tr><tr><td>20</td><td><a href="20-agent.md">Agent：让模型动手做事</a></td><td>工具调用约定、ReAct 循环、上下文预算、记忆分层、失败模式与评测</td></tr><tr><td>21</td><td><a href="21-harness.md">Harness：模型外面那一圈代码</a></td><td>主循环、工具运行时、权限与沙箱、压缩策略、子代理、事件流与评测</td></tr><tr><td>22</td><td><a href="22-scale-faq.md">规模地图与常见误解</a></td><td>参数量、FLOPs、显存怎么估；十个流传很广的错误说法</td></tr><tr><td>23</td><td><a href="23-exercises.md">习题与动手实验</a></td><td>按章挑选的十二道题（含答案）与五个能在本机跑的实验：改超参、写 BPE、验 KV 账、看量化误差、调采样</td></tr><tr><td>24</td><td><a href="24-glossary.md">术语表</a></td><td>按主题排列的八十个术语，一句话说清它是什么、在哪一章详细讲过</td></tr><tr><td>25</td><td><a href="25-source-reading.md">源码导读：读一个真实的注意力 kernel</a></td><td>从 Triton 官方教程的分块注意力出发，逐行读在线 softmax，再对照 vLLM 生产版多了什么：分页、GQA、变长、split-K、量化</td></tr><tr><td>26</td><td><a href="26-research-frontier.md">研究前沿：推理引擎正在往哪走</a></td><td>2025–2026 年这条线的八条主线：PD 分离与 KV 传输、KV 作为一等存储、架构与系统协同、投机与 MTP、MoE 大规模并行、kernel 与编译、长上下文与 agent 负载、调度与公平；附研究地图、八个可验证空白与读论文的五问</td></tr></tbody></table></div>
+<p>合集：<a href="book.md">book.md</a>（全部章节拼接，便于全文搜索）。</p>
+  <div class="pager"><span></span><a href="00-hero.html" style="text-align:right">怎么读这份材料 →</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>选哪个字：温度、top-k、top-p · 大模型是怎么想出一个字的</title>
+<link rel="stylesheet" href="katex.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav>
+  <div class="brand">LLM · From Scratch</div>
+  <a href="index.html">目录与说明</a>
+  <a href="00-hero.html">00 · 怎么读这份材料</a>
+  <a href="01-overview.html">01 · 全景：一次推理的七个阶段</a>
+  <a href="02-math.html">02 · 必备数学：只有六件事</a>
+  <a href="03-tokenizer.html">03 · 分词：把文字变成整数</a>
+  <a href="04-embedding.html">04 · 嵌入：把整数变成向量</a>
+  <a href="05-attention.html">05 · 注意力：20 个位置怎么互相看</a>
+  <a href="06-residual-norm.html">06 · 残差与归一化：让 96 层也能训</a>
+  <a href="07-ffn.html">07 · 前馈网络：模型把知识存在哪</a>
+  <a href="08-forward-pass.html">08 · 完整前向：从字符到概率</a>
+  <a href="09-sampling.html" class="on">09 · 选哪个字：温度、top-k、top-p</a>
+  <a href="10-inference-engine.html">10 · 推理引擎：把 FLOPs 变成毫秒</a>
+  <a href="11-kv-cache.html">11 · KV cache：显存、带宽与并发</a>
+  <a href="12-serving-params.html">12 · 服务参数：vLLM 与 SGLang 调参</a>
+  <a href="13-gpu.html">13 · GPU 执行：一次 decode 是怎么落到硬件上的</a>
+  <a href="14-quant-spec.html">14 · 推理加速：量化、投机解码与约束解码</a>
+  <a href="15-long-context.html">15 · 长上下文：位置外推、KV 压缩与 1M 的账</a>
+  <a href="16-arch-variants.html">16 · 架构变体：MoE、MLA、Mamba 与 MTP</a>
+  <a href="17-training.html">17 · 训练：从下一个字到对齐人类</a>
+  <a href="18-reasoning.html">18 · 推理模型：让模型多想一想</a>
+  <a href="19-implement.html">19 · 从零实现：200 行 numpy</a>
+  <a href="20-agent.html">20 · Agent：让模型动手做事</a>
+  <a href="21-harness.html">21 · Harness：模型外面那一圈代码</a>
+  <a href="22-scale-faq.html">22 · 规模地图与常见误解</a>
+  <a href="23-exercises.html">23 · 习题与动手实验</a>
+  <a href="24-glossary.html">24 · 术语表</a>
+  <a href="25-source-reading.html">25 · 源码导读：读一个真实的注意力 kernel</a>
+  <a href="26-research-frontier.html">26 · 研究前沿：推理引擎正在往哪走</a>
+  <a href="book.html">合集（单页）</a>
+</nav>
+<main>
+  <div class="crumb">第九章 · 解码与采样</div>
+  <h1>选哪个字：温度、top-k、top-p</h1>
+<p>模型输出的是 17 个数，不是一个字。从"分布"到"实际生成的那个字符"，中间隔着采样策略。本章的三个旋钮——温度、top-k、top-p——决定了同一个模型是写得像教科书还是像醉汉。</p>
+<h2>先看清分布的形状</h2>
+<p>上下文越长、越确定，分布就越尖。以下四个上下文都来自同一个模型：</p>
+<div class="tablewrap"><table><thead><tr><th>上下文</th><th>前三个候选</th><th>熵</th><th>有效候选数</th></tr></thead><tbody><tr><td><code>the ␣</code></td><td>m 0.411、l 0.327、r 0.108</td><td>1.393</td><td>4.0</td></tr><tr><td><code>the cat ␣</code></td><td>s 0.567、a 0.205、r 0.132</td><td>1.217</td><td>3.4</td></tr><tr><td><code>a ␣</code></td><td>o 0.421、d 0.298、c 0.108</td><td>1.615</td><td>5.0</td></tr><tr><td><code>the cat sat on the ␣</code></td><td>l 0.569、m 0.426、g 0.005</td><td>0.710</td><td>2.0</td></tr></tbody></table></div>
+<p>"有效候选数"是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.08125em;">H</span></span></span></span></span></span></span></span></span></span></span></span>，熵的指数：它告诉你这个分布"实际上相当于在几个选项里挑"。可以看到，同样的模型在不同位置上的确定性差别很大——有的地方几乎只有一个选择，有的地方四个选项势均力敌。</p>
+<h2>策略一：贪心，永远选最大</h2>
+<p>最简单的做法是每次取概率最大的那个。这叫<strong>贪心解码</strong>（greedy），等价于温度趋近 0。</p>
+<p>它的问题是<strong>会卡进循环</strong>。训练好的小模型贪心生成时输出过长这样：</p>
+<pre><code class="language-text">the cat sat.the dog cat sat.the dog dog sat.the dog og og t.the rate</code></pre>
+<p>"the dog" 和 "sat.the" 反复出现，中间还出现了 "og og" 这种碎片。原因很直接：一旦进入某个高频短语，最可能的下一词就是把这个短语继续下去，而它又恰好把上下文推回同一个状态。语言模型的目标是"局部最可能"，不是"整体最好"。</p>
+<blockquote><p><strong>贪心为什么不是最优</strong></p>
+<p>每一步都选最大概率，得到的是<strong>每一步的局部最优</strong>，不是整句话的全局最优。想求全局最优得做搜索（束搜索），但"整句话概率最大"往往对应最平庸、最重复的文本——因为模型见过的常见句子概率都高。开放式生成想要的是"合理且有变化"，这本身就是个采样的目标，不是优化的目标。</p></blockquote>
+<h2>策略二：温度</h2>
+<p>温度在 softmax 之前作用：把 logits 除以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span>，再归一化。</p>
+<div class="equation"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5488em;vertical-align:-1.1218em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4358em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">exp</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.04398em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop">exp</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.04398em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.1218em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:2em;"></span><span class="mopen">(</span><span class="mord">9.1</span><span class="mclose">)</span></span></span></span></span></div>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 会让分布更尖（大的更大、小的更小），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> 会让分布更平（小概率事件有机会被选中），<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> 退化成贪心。用 <code>the ␣</code> 那组 logits 实测：</p>
+<div class="tablewrap"><table><thead><tr><th>温度</th><th>m</th><th>l</th><th>r</th><th>d</th><th>熵</th></tr></thead><tbody><tr><td>T = 0.3</td><td>0.673</td><td>0.313</td><td>0.008</td><td>0.006</td><td>0.70</td></tr><tr><td>T = 0.5</td><td>0.565</td><td>0.357</td><td>0.039</td><td>0.032</td><td>0.96</td></tr><tr><td><strong>T = 1.0</strong></td><td>0.411</td><td>0.327</td><td>0.108</td><td>0.098</td><td>1.39</td></tr><tr><td>T = 1.5</td><td>0.335</td><td>0.287</td><td>0.137</td><td>0.129</td><td>1.59</td></tr><tr><td>T = 2.0</td><td>0.291</td><td>0.259</td><td>0.149</td><td>0.142</td><td>1.71</td></tr></tbody></table></div>
+<p>注意 T=2.0 时前两名已经几乎相等，而 r、d 这类原本只有 10% 的选项爬到了 15%。温度不改变候选的<strong>顺序</strong>，只改变分布的<strong>平坦程度</strong>。</p>
+<blockquote><p><strong>温度不能乱调</strong></p>
+<p>调高温度不是"更有创造力"，而是"更愿意接受低概率的词"。T 太高时模型会开始编造不存在的词、破坏语法；T 太低时文本会变得呆板重复。代码生成通常用 0.0–0.2，聊天 0.7–0.9，创意写作 1.0–1.2，是经验值而不是定律。</p></blockquote>
+<h2>策略三：top-k</h2>
+<p>只保留概率最高的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> 个候选，其余概率清零，再在剩下的里面重新归一化并采样。</p>
+<p><strong>k=5 时（用 trace 那组极尖的分布）</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>原始前 5</td><td>a 0.9987、w 0.0009、. 0.0005、d 0.000005、l 0.000001</td></tr><tr><td>剔除尾部</td><td>17 个候选里丢掉 12 个，剩下的 5 个重新归一化</td></tr><tr><td>效果</td><td>在这个位置几乎没变化（本来就 99.9% 在 a）；在平坦的位置效果显著</td></tr></tbody></table></div>
+<p>top-k 的问题是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> 固定。分布很尖时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span></span></span></span> 会放进一堆垃圾；分布很平时 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> 又会砍掉合理选项。于是有了 top-p。</p>
+<h2>策略四：top-p（核采样）</h2>
+<p>把候选按概率从大到小排，累加，直到总和超过 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>（比如 0.9），只保留这几个。"候选池的大小由分布自己决定"：</p>
+<p><strong>top-p = 0.9 在两组分布上的不同表现</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>尖分布 <code>the cat sat on the ␣</code></td><td>l 0.569 + m 0.426 = 0.995 &gt; 0.9 → 只保留 <strong>2</strong> 个候选</td></tr><tr><td>平分布 <code>the ␣</code></td><td>m .411 + l .327 + r .108 + d .098 = 0.944 &gt; 0.9 → 保留 <strong>4</strong> 个</td></tr><tr><td>更平的情形</td><td>候选很分散时，池子会自动变大，最多到整个词表</td></tr></tbody></table></div>
+<p>这就是核采样（nucleus sampling）的核心：<strong>用累积概率而不是固定数量来划边界</strong>。实践中常把 top-k 和 top-p 一起用：先 top-k 砍掉长尾，再 top-p 按形状收紧。本页的采样演示就是这个顺序。</p>
+<blockquote><p><strong>交互演示：亲手调一次采样</strong>（温度 / top-k / top-p） —— 在 HTML 版里可直接拖动 / 点击。</p></blockquote>
+<h2>束搜索：为什么大模型很少用</h2>
+<p>束搜索（beam search）同时保留 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> 条候选序列，每步扩展所有候选再选概率乘积最高的 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> 条。它在机器翻译里是标配——因为"最可能的译文"确实是好译文。</p>
+<p>但在开放式生成里它有两个毛病：</p>
+<ul><li><strong>长度偏置</strong>。概率是乘出来的，序列越长概率越低，束搜索天然偏好短句；</li><li><strong>平庸化</strong>。最大化整句概率会收敛到"最安全"的表达，读起来毫无信息量。</li></ul>
+<p>所以聊天、写作、代码补全一律用采样。只有在需要"确定性输出"时才会用贪心或低温采样。</p>
+<h2>重复惩罚</h2>
+<p>采样仍可能陷入重复。一个简单有效的补丁是：在 softmax 之前，把<strong>已经出现过的 token</strong> 的 logit 减去一个惩罚项。按出现次数扣分叫频率惩罚（frequency penalty），按是否出现扣分叫存在惩罚（presence penalty）。</p>
+<p>这相当于人为修改了模型给出的分布——它已经不是"模型认为的概率"了。所以惩罚系数通常很小（0.1–1.0），调大了会让模型刻意回避正确的高频词。</p>
+<h2>为什么同一个 prompt 两次回答不同</h2>
+<p>因为采样是随机的。即使温度很低，只要不是 0，就有非零概率抽到别的 token；一旦某一个 token 不同，后面的整条轨迹就完全不同——这就是自回归的<strong>蝴蝶效应</strong>。即使把温度设为 0，服务端也可能因为浮点运算顺序、批处理的动态形状、多卡通信的归约顺序而产生微小差异，偶尔让两个 logit 交换名次。</p>
+<p><strong>常见参数对应的行为</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>T=0（或 0.01）</td><td>几乎确定，适合抽取结构化信息、代码、数学</td></tr><tr><td>T=0.7, top-p=0.9</td><td>聊天默认，兼顾稳定与变化</td></tr><tr><td>T=1.0–1.2, top-p=0.95</td><td>创意写作，接受更多低概率用词</td></tr><tr><td>T=1.5+</td><td>大概率开始语无伦次，慎用</td></tr></tbody></table></div>
+<blockquote><p><strong>小结</strong></p>
+<p>模型给出一个分布，采样器决定从里面怎么取。温度改变形状，top-k 和 top-p 改变候选范围，束搜索改变搜索目标。这三件事弄明白，就能解释为什么同一个模型换一套参数，读起来像两个人写的。</p></blockquote>
+<blockquote><p><strong>下一章</strong></p>
+<p>到这里，一次推理的数学过程完整了。但真实的推理服务要同时服务成百上千个用户，还要在几十毫秒内返回。第 10 章讲工程：KV cache、FlashAttention、量化、投机解码、连续批处理。</p></blockquote>
+  <div class="pager"><a href="08-forward-pass.html">← 完整前向：从字符到概率</a><a href="10-inference-engine.html" style="text-align:right">推理引擎：把 FLOPs 变成毫秒 →</a></div>
+</main>
+</div>
+</body>
+</html>

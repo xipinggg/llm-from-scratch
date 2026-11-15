@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>术语表 · 大模型是怎么想出一个字的</title>
+<link rel="stylesheet" href="katex.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav>
+  <div class="brand">LLM · From Scratch</div>
+  <a href="index.html">目录与说明</a>
+  <a href="00-hero.html">00 · 怎么读这份材料</a>
+  <a href="01-overview.html">01 · 全景：一次推理的七个阶段</a>
+  <a href="02-math.html">02 · 必备数学：只有六件事</a>
+  <a href="03-tokenizer.html">03 · 分词：把文字变成整数</a>
+  <a href="04-embedding.html">04 · 嵌入：把整数变成向量</a>
+  <a href="05-attention.html">05 · 注意力：20 个位置怎么互相看</a>
+  <a href="06-residual-norm.html">06 · 残差与归一化：让 96 层也能训</a>
+  <a href="07-ffn.html">07 · 前馈网络：模型把知识存在哪</a>
+  <a href="08-forward-pass.html">08 · 完整前向：从字符到概率</a>
+  <a href="09-sampling.html">09 · 选哪个字：温度、top-k、top-p</a>
+  <a href="10-inference-engine.html">10 · 推理引擎：把 FLOPs 变成毫秒</a>
+  <a href="11-kv-cache.html">11 · KV cache：显存、带宽与并发</a>
+  <a href="12-serving-params.html">12 · 服务参数：vLLM 与 SGLang 调参</a>
+  <a href="13-gpu.html">13 · GPU 执行：一次 decode 是怎么落到硬件上的</a>
+  <a href="14-quant-spec.html">14 · 推理加速：量化、投机解码与约束解码</a>
+  <a href="15-long-context.html">15 · 长上下文：位置外推、KV 压缩与 1M 的账</a>
+  <a href="16-arch-variants.html">16 · 架构变体：MoE、MLA、Mamba 与 MTP</a>
+  <a href="17-training.html">17 · 训练：从下一个字到对齐人类</a>
+  <a href="18-reasoning.html">18 · 推理模型：让模型多想一想</a>
+  <a href="19-implement.html">19 · 从零实现：200 行 numpy</a>
+  <a href="20-agent.html">20 · Agent：让模型动手做事</a>
+  <a href="21-harness.html">21 · Harness：模型外面那一圈代码</a>
+  <a href="22-scale-faq.html">22 · 规模地图与常见误解</a>
+  <a href="23-exercises.html">23 · 习题与动手实验</a>
+  <a href="24-glossary.html" class="on">24 · 术语表</a>
+  <a href="25-source-reading.html">25 · 源码导读：读一个真实的注意力 kernel</a>
+  <a href="26-research-frontier.html">26 · 研究前沿：推理引擎正在往哪走</a>
+  <a href="book.html">合集（单页）</a>
+</nav>
+<main>
+  <div class="crumb">第二十四章 · 附录</div>
+  <h1>术语表</h1>
+<p>这一章按主题把全书的术语列在一起，每个一句话。遇到不熟的词先查这里，再回到对应的章节看推导与数字。</p>
+<h2>数学与基础</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>张量（tensor）</td><td>多维数组；本页模型里一个 token 是 8 维向量，一批是 [T, 8] 的矩阵。</td></tr><tr><td>点积</td><td>逐元素相乘再相加，衡量两个向量的"同向程度"，注意力打分的核心。</td></tr><tr><td>softmax</td><td>把任意实数变成非负、和为 1 的分布；带温度参数。</td></tr><tr><td>交叉熵</td><td>预测分布与真实标签之间的损失，语言模型预训练的目标。</td></tr><tr><td>困惑度（PPL）</td><td>交叉熵取指数，可理解为"每一步在多少个候选里犹豫"。</td></tr><tr><td>梯度下降</td><td>沿损失对参数的负梯度方向更新参数；学习率决定步长。</td></tr><tr><td>链式法则</td><td>复合函数求导的分解规则，反向传播的全部数学基础。</td></tr><tr><td>反向传播</td><td>从损失往回逐层计算梯度；手写实现见第 19 章。</td></tr><tr><td>Adam / AdamW</td><td>按梯度的一阶与二阶矩自适应调整步长的优化器。</td></tr><tr><td>数值梯度校验</td><td>用微小扰动近似导数，与解析梯度对比，验证反向传播写对没写对。</td></tr></tbody></table></div>
+<h2>分词与嵌入</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>token</td><td>模型处理的最小单位，可以是字符、子词或字节。</td></tr><tr><td>词表（vocab）</td><td>所有 token 的编号集合，决定模型的输入输出空间。</td></tr><tr><td>BPE</td><td>从字符出发，反复合并最高频的相邻对，得到子词词表。</td></tr><tr><td>字节级 BPE</td><td>以 UTF-8 字节为起点，任何文本都不会出现未登录词。</td></tr><tr><td>嵌入（embedding）</td><td>把 token 编号查表变成向量；可训练的参数矩阵。</td></tr><tr><td>位置编码</td><td>让模型知道 token 顺序的信息，本页用可学习绝对位置，主流用 RoPE。</td></tr><tr><td>RoPE</td><td>旋转位置编码，把位置写成向量的旋转，点积中自然出现相对位置。</td></tr><tr><td>权重共享（tied）</td><td>输入嵌入表与输出投影共用同一矩阵，省一半词表参数。</td></tr></tbody></table></div>
+<h2>注意力与结构</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>Q / K / V</td><td>查询、键、值：同一个输入向量乘三个矩阵得到的三种角色。</td></tr><tr><td>因果掩码</td><td>让位置 i 只能看见 ≤ i 的位置，保证训练与生成一致。</td></tr><tr><td>多头注意力</td><td>把向量切成若干头，各自独立做注意力，再拼回投影。</td></tr><tr><td>MHA / MQA / GQA</td><td>头与 KV 的共享程度：每头独立 / 全部共享 / 分组共享。</td></tr><tr><td>MLA</td><td>把 KV 缓存成低维隐向量，用时再投影，DeepSeek 的方案。</td></tr><tr><td>残差连接</td><td>输出 = 输入 + 子层输出，给梯度留一条恒等通路。</td></tr><tr><td>LayerNorm / RMSNorm</td><td>按特征维做归一化；RMSNorm 只除均方根，更快。</td></tr><tr><td>Pre-LN / Post-LN</td><td>归一化放在子层之前还是之后；前者更容易训练深层。</td></tr><tr><td>FFN</td><td>两层线性加一个非线性，占 Transformer 参数的大头。</td></tr><tr><td>SwiGLU</td><td>带门控的前馈结构：升维后一分为二，一份做门。</td></tr><tr><td>MoE</td><td>多个专家 FFN，每个 token 只激活其中几个，总参数与计算解耦。</td></tr><tr><td>路由（router）</td><td>决定一个 token 该走哪几个专家的打分网络。</td></tr><tr><td>负载均衡损失</td><td>防止所有 token 挤向同一专家的辅助损失。</td></tr><tr><td>QK-norm</td><td>对 Q/K 做归一化，抑制长训练中注意力分数的爆炸。</td></tr></tbody></table></div>
+<h2>训练与对齐</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>预训练</td><td>在海量文本上做下一个 token 预测，得到基座模型。</td></tr><tr><td>缩放定律</td><td>损失随参数量、数据量、算力呈幂律下降；Chinchilla 给出 20 token/参数的配比。</td></tr><tr><td>SFT</td><td>监督微调：用指令-回答对训练，只对回答部分算损失。</td></tr><tr><td>RLHF</td><td>用人类偏好训奖励模型，再用 RL 优化策略。</td></tr><tr><td>DPO</td><td>跳过奖励模型，直接在偏好对上优化策略。</td></tr><tr><td>RLVR</td><td>用可自动验证的奖励（答案对错）做强化学习。</td></tr><tr><td>PPO / GRPO</td><td>带裁剪的策略梯度；GRPO 用组内均值当基线，省掉价值网络。</td></tr><tr><td>奖励黑客</td><td>策略钻奖励模型的空子，指标好看但行为变坏。</td></tr><tr><td>能力涌现</td><td>规模跨过某个阈值后评测分数突然抬升的现象。</td></tr><tr><td>对齐税</td><td>对齐训练后某些基础能力反而下降的代价。</td></tr><tr><td>DP / TP / PP / EP</td><td>数据、张量、流水线、专家并行，四种切分方式。</td></tr><tr><td>ZeRO / FSDP</td><td>把优化器状态、梯度、参数分片，省显存。</td></tr></tbody></table></div>
+<h2>推理与服务</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>prefill</td><td>把整段输入一次算完，计算密集。</td></tr><tr><td>decode</td><td>每次只生成一个 token，带宽密集。</td></tr><tr><td>KV cache</td><td>缓存历史 token 的 K/V，避免重复计算；显存随上下文线性增长。</td></tr><tr><td>TTFT / TPOT</td><td>首 token 延迟 / 每 token 间隔，两个用户可感知的指标。</td></tr><tr><td>MHA 的 KV 公式</td><td>每 token 2·L·H_kv·d·b 字节，两个 2 分别来自 K/V 与 fp16。</td></tr><tr><td>分页注意力</td><td>把 KV 按块管理，消除预分配的内部碎片，支持共享。</td></tr><tr><td>前缀缓存</td><td>相同前缀的 KV 只算一次，后续请求直接复用。</td></tr><tr><td>抢占（preemption）</td><td>显存不够时丢弃某些请求的 KV，稍后重算或换出。</td></tr><tr><td>chunked prefill</td><td>把长 prefill 切块，与 decode 混批，稳住 ITL。</td></tr><tr><td>投机解码</td><td>草稿模型先猜若干 token，大模型一次验证；用拒绝采样保证分布不变。</td></tr><tr><td>约束解码</td><td>按语法掩掉非法 token，保证输出符合 JSON/正则。</td></tr><tr><td>温度 / top-k / top-p</td><td>调整采样分布的形状与候选池。</td></tr><tr><td>beam search</td><td>同时保留 k 条候选序列，逐 token 扩展取最优。</td></tr></tbody></table></div>
+<h2>硬件与性能</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>算术强度</td><td>每搬一字节数据做了多少次浮点运算；与脊点比较判断瓶颈。</td></tr><tr><td>roofline</td><td>用"带宽上限"和"算力上限"两条线描述一个算子能跑多快。</td></tr><tr><td>Tensor Core</td><td>GPU 上专门做矩阵乘的单元，fp16/fp8 吞吐远高于普通核心。</td></tr><tr><td>SM</td><td>流式多处理器，GPU 的调度与执行单元。</td></tr><tr><td>显存带宽</td><td>H100 约 3.35 TB/s，decode 速度的上限由它决定。</td></tr><tr><td>kernel</td><td>在 GPU 上执行的一个函数；一次 decode 有几百个。</td></tr><tr><td>流（stream）</td><td>GPU 上的命令队列，同一流内顺序执行。</td></tr><tr><td>CUDA graph</td><td>把一串 kernel 启动录下来，一次回放，消除 CPU 提交开销。</td></tr><tr><td>pinned memory</td><td>锁页内存，可被 GPU 直接读取，H2D 拷贝更快。</td></tr><tr><td>FlashAttention</td><td>分块计算注意力，不落盘完整的 T×T 矩阵，省显存且更快。</td></tr><tr><td>all-reduce</td><td>多卡之间求和同步，张量并行每层都要做。</td></tr><tr><td>NCCL</td><td>NVIDIA 的集合通信库。</td></tr><tr><td>Marlin</td><td>4bit 权重的 GEMM kernel，在计算时边取边还原。</td></tr><tr><td>量化粒度</td><td>per-tensor / per-channel / per-group，越细误差越小、开销越大。</td></tr><tr><td>FP8 e4m3</td><td>8 位浮点，范围约 ±448，H100 原生支持。</td></tr></tbody></table></div>
+<h2>长上下文与新架构</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>位置插值（PI）</td><td>把位置整体除以倍数，映射回训练见过的区间。</td></tr><tr><td>NTK-aware</td><td>改 RoPE 底数，按维度重新分配频率。</td></tr><tr><td>YaRN</td><td>NTK + 分维度处理 + 注意力温度，少量微调即可长上下文。</td></tr><tr><td>滑窗注意力</td><td>每个 token 只看最近 w 个位置，计算量降到 O(T·w)。</td></tr><tr><td>attention sink</td><td>序列开头几个 token 的 KV 特别大，模型把它们当"落点"。</td></tr><tr><td>H2O</td><td>只保留注意力权重高的 KV，按重要性淘汰。</td></tr><tr><td>Mamba / SSM</td><td>用固定大小的状态递推代替注意力，开销与长度无关。</td></tr><tr><td>MTP</td><td>多 token 预测：一次前向同时预测后面几个位置。</td></tr><tr><td>Needle in a Haystack</td><td>长文本里藏一句话再问，测长上下文的实际可用性。</td></tr><tr><td>Lost in the Middle</td><td>关键信息位于文本中部时更容易被忽略的现象。</td></tr></tbody></table></div>
+<h2>推理模型、agent 与 harness</h2>
+<div class="tablewrap"><table><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody><tr><td>思维链（CoT）</td><td>让模型先写出推导过程再给答案，用 token 换计算深度。</td></tr><tr><td>自一致性</td><td>采样多条推理链，对最终答案投票。</td></tr><tr><td>pass@k</td><td>k 次采样中至少有一次正确的概率。</td></tr><tr><td>PRM / ORM</td><td>过程奖励模型 / 结果奖励模型。</td></tr><tr><td>测试时计算</td><td>推理阶段多花算力换准确率：更长、更多条、或搜索。</td></tr><tr><td>MCTS</td><td>蒙特卡洛树搜索，用 UCT 平衡探索与利用。</td></tr><tr><td>蒸馏</td><td>用强模型的输出训练小模型。</td></tr><tr><td>agent</td><td>模型 + 工具 + 循环 + 环境 + 预算，能多步完成任务的系统。</td></tr><tr><td>工具调用</td><td>模型输出结构化的调用请求，由 harness 执行并回填结果。</td></tr><tr><td>harness</td><td>模型外面那一圈工程代码：循环、工具、权限、压缩、观测。</td></tr><tr><td>上下文压缩</td><td>把消耗过的工具输出从后续上下文里删掉或摘要，控制 token 增长。</td></tr><tr><td>子代理</td><td>父代理派生子代理执行子任务，只回传结论，隔离噪声。</td></tr><tr><td>golden tasks</td><td>一小批固定的代表性任务，用来做回归测试。</td></tr></tbody></table></div>
+<blockquote><p><strong>怎么用这张表</strong></p>
+<p>术语只是索引。真正要带走的是每个词背后的一两个数字与一条公式——KV 是 2·L·H_kv·d·b，prefill 是计算密集、decode 是带宽密集，投机解码的收益是 (1−α^{γ+1})/((1−α)(1+γc))。记住这些，词自然就记住了。</p></blockquote>
+<blockquote><p><strong>读完了</strong></p>
+<p>第 22 章是规模地图与常见误解，适合配着这章一起翻；第 26 章是一张研究前沿地图，遇到新论文时回来对照。如果只想再看一眼全书的骨架，回到第 1 章的七个阶段。</p></blockquote>
+  <div class="pager"><a href="23-exercises.html">← 习题与动手实验</a><a href="25-source-reading.html" style="text-align:right">源码导读：读一个真实的注意力 kernel →</a></div>
+</main>
+</div>
+</body>
+</html>

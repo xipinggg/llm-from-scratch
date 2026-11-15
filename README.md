@@ -76,3 +76,29 @@ pre-LN + 可学习绝对位置 + GELU + 权重共享输出头，可训练参数 
 Adam + 余弦学习率训练 12000 步，最终损失 0.182（困惑度 1.2）。
 
 示例 trace：`"the cat sat on the m"` → 下一个字符 `a`，概率 0.9987。
+
+## Markdown 版（分支 `markdown`）
+
+本分支把 27 章转换成纯 Markdown，方便检索、引用和导入其他笔记工具：
+
+- `md/`：逐章 Markdown（`00-hero.md` … `26-research-frontier.md`）+ 目录 `md/README.md`
+- `md/book.md`：全部章节的合集
+- `tools/html2md.py`：转换器（读 `src/parts/*.html`，输出 `md/`）
+
+重新生成：
+
+```bash
+$PY tools/html2md.py
+```
+
+转换规则：公式转成 `$…$` / `$$…$$`（右对齐编号写成 `\qquad (5.1)`）、表格转 GFM、演算面板转两列表、`.compare`/`.keyidea`/`.note` 转引用块、代码块保留语言标记；`<svg>` 流程图与交互演示不导出（Markdown 无法承载），对应位置留下说明。
+
+## 在线文档站（分支 `markdown`）
+
+`site/` 是由 Markdown 生成的静态站点（每章一页、左侧目录、公式在构建期渲染成静态 HTML），可直接用 GitHub Pages 托管：
+
+```bash
+$PY tools/build_site.py     # 读取 md/ 生成 site/
+```
+
+生成物已提交，Pages 源设为 `markdown` 分支的 `/site` 目录即可在线阅读。

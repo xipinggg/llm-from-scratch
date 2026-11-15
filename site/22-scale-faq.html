@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>规模地图与常见误解 · 大模型是怎么想出一个字的</title>
+<link rel="stylesheet" href="katex.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav>
+  <div class="brand">LLM · From Scratch</div>
+  <a href="index.html">目录与说明</a>
+  <a href="00-hero.html">00 · 怎么读这份材料</a>
+  <a href="01-overview.html">01 · 全景：一次推理的七个阶段</a>
+  <a href="02-math.html">02 · 必备数学：只有六件事</a>
+  <a href="03-tokenizer.html">03 · 分词：把文字变成整数</a>
+  <a href="04-embedding.html">04 · 嵌入：把整数变成向量</a>
+  <a href="05-attention.html">05 · 注意力：20 个位置怎么互相看</a>
+  <a href="06-residual-norm.html">06 · 残差与归一化：让 96 层也能训</a>
+  <a href="07-ffn.html">07 · 前馈网络：模型把知识存在哪</a>
+  <a href="08-forward-pass.html">08 · 完整前向：从字符到概率</a>
+  <a href="09-sampling.html">09 · 选哪个字：温度、top-k、top-p</a>
+  <a href="10-inference-engine.html">10 · 推理引擎：把 FLOPs 变成毫秒</a>
+  <a href="11-kv-cache.html">11 · KV cache：显存、带宽与并发</a>
+  <a href="12-serving-params.html">12 · 服务参数：vLLM 与 SGLang 调参</a>
+  <a href="13-gpu.html">13 · GPU 执行：一次 decode 是怎么落到硬件上的</a>
+  <a href="14-quant-spec.html">14 · 推理加速：量化、投机解码与约束解码</a>
+  <a href="15-long-context.html">15 · 长上下文：位置外推、KV 压缩与 1M 的账</a>
+  <a href="16-arch-variants.html">16 · 架构变体：MoE、MLA、Mamba 与 MTP</a>
+  <a href="17-training.html">17 · 训练：从下一个字到对齐人类</a>
+  <a href="18-reasoning.html">18 · 推理模型：让模型多想一想</a>
+  <a href="19-implement.html">19 · 从零实现：200 行 numpy</a>
+  <a href="20-agent.html">20 · Agent：让模型动手做事</a>
+  <a href="21-harness.html">21 · Harness：模型外面那一圈代码</a>
+  <a href="22-scale-faq.html" class="on">22 · 规模地图与常见误解</a>
+  <a href="23-exercises.html">23 · 习题与动手实验</a>
+  <a href="24-glossary.html">24 · 术语表</a>
+  <a href="25-source-reading.html">25 · 源码导读：读一个真实的注意力 kernel</a>
+  <a href="26-research-frontier.html">26 · 研究前沿：推理引擎正在往哪走</a>
+  <a href="book.html">合集（单页）</a>
+</nav>
+<main>
+  <div class="crumb">第二十二章 · 收尾</div>
+  <h1>规模地图与常见误解</h1>
+<p>前十八章讲的都是"机制"。这一章讲"数量"：真实的模型有多大、算一笔账要多少显存和算力，以及十个流传很广但经不起推敲的说法。</p>
+<h2>规模地图：从玩具到前沿</h2>
+<p>下表把本页的小模型和几个公开模型放在一起。注意最后两列：每 token 的推理算力和 KV cache 开销，它们决定了模型能不能跑在你的设备上。</p>
+<div class="tablewrap"><table><thead><tr><th>模型</th><th>层</th><th>d_model</th><th>头/KV</th><th>参数</th><th>训练 token</th><th>FLOPs/token</th><th>KV/token</th></tr></thead><tbody><tr><td>本页玩具模型</td><td>2</td><td>8</td><td>2/2</td><td>1,608</td><td>≈ 8 千</td><td>6.4 万</td><td>256 B</td></tr><tr><td>GPT-2 small</td><td>12</td><td>768</td><td>12/12</td><td>124M</td><td>≈ 10B</td><td>0.25 GFLOPs</td><td>≈ 72 KB</td></tr><tr><td>Llama 3 8B</td><td>32</td><td>4,096</td><td>32/8</td><td>8.0B</td><td>15T</td><td>16 GFLOPs</td><td>128 KB</td></tr><tr><td>GPT-3</td><td>96</td><td>12,288</td><td>96/96</td><td>175B</td><td>300B</td><td>350 GFLOPs</td><td>≈ 5.5 MB</td></tr><tr><td>Llama 3 70B</td><td>80</td><td>8,192</td><td>64/8</td><td>70.6B</td><td>15T</td><td>141 GFLOPs</td><td>320 KB</td></tr><tr><td>DeepSeek-V3（MoE）</td><td>61</td><td>7,168</td><td>128/—</td><td>671B（激活 37B）</td><td>14.8T</td><td>74 GFLOPs</td><td>≈ 70 KB（MLA）</td></tr></tbody></table></div>
+<p>这张表里藏着三个可以自己推导的规律：</p>
+<p><strong>规律一：参数量 ≈ 12 × 层数 × d²。</strong>每层注意力 4 个 d×d 矩阵（q、k、v、o）= 4d²，前馈两个矩阵 = 8d²（当隐藏层是 4d），合计 12d²。拿 Llama 3 8B 验算：12 × 32 × 4096² ≈ 6.4B，加上词表嵌入 128256 × 4096 ≈ 0.53B，约 7B——和报告的 8B 同量级（GQA 减少了一些 k/v 参数，FFN 用了 3.5d，两下抵消后还差一点）。</p>
+<p><strong>规律二：前向 FLOPs ≈ 2 × 参数量。</strong>每个参数在每个 token 上做一次乘加（2 次浮点运算）。8B 模型 ≈ 16 GFLOPs/token，GPT-3 175B ≈ 350 GFLOPs/token。训练一次要再乘 3（前向 + 反向约 2 倍前向），所以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">FLOPs</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">6</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span>。</p>
+<p><strong>规律三：KV cache 每 token ≈ 2 × 层数 × KV头数 × head_dim × 精度字节。</strong>Llama 3 8B 是 2 × 32 × 8 × 128 × 2 = 131072 字节 ≈ 128 KB。8K 上下文就是 1 GB——这还只是缓存，不含权重。</p>
+<p><strong>为什么 70B 模型需要"好几张卡"</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>权重（BF16）</td><td>70.6B × 2 B ≈ 141 GB</td></tr><tr><td>单张 H100</td><td>80 GB —— 装不下权重，必须切分到 2 张以上</td></tr><tr><td>KV cache（8K 上下文）</td><td>320 KB × 8192 ≈ 2.6 GB / 请求</td></tr><tr><td>结论</td><td>权重决定"能不能加载"，KV cache 决定"能同时服务几个人"</td></tr></tbody></table></div>
+<h2>十个常见误解</h2>
+<p><strong>1. "模型在思考，只是我们看不懂。"</strong>不准确。模型每步做的是一件很具体的事：把当前上下文编码成一个向量，乘一个大矩阵，得到词表上每个 token 的分数。没有循环、没有内部状态、没有"想法"。但"没有意识"不等于"没有能力"——涌现出来的推理行为是真实的，只是机制上不是人类那种思考。</p>
+<p><strong>2. "参数越多越聪明。"</strong>只在数据、算力同步增长时成立。一个 70B 模型如果只喂 300B token（每参数 4 个 token），会被一个喂了 2T token 的 7B 模型在大部分任务上打败。Chinchilla 之后，业界更看重"训练是否充分"，而不是单看参数量。</p>
+<p><strong>3. "上下文窗口 = 记忆力。"</strong>窗口是"能塞进去多少"，不是"能用到多少"。注意力是软检索：信息在窗口中间时最容易被忽略（lost in the middle 现象）。把关键指令放在开头或结尾，比放在中间更可靠。</p>
+<p><strong>4. "温度调高会更聪明。"</strong>温度只改变采样分布的平坦程度，不改变模型学到的知识。温度为 0 时选概率最高的 token，适合事实性任务；温度高只增加多样性，也增加胡说八道的概率。</p>
+<p><strong>5. "幻觉是因为训练数据里有错。"</strong>数据有错只是原因之一。更根本的原因是训练目标：模型被训练成"输出最可能的下一个 token"，而不是"输出真实的话"。当它不知道答案时，最可能的续写依然是一个流畅的句子。RLHF 还可能加剧这一点——模型学会了"给出一个看起来像答案的答案"比"说不知道"更容易获得高分。</p>
+<p><strong>6. "它有记忆，记得我们上次聊的。"</strong>模型本身是无状态的。每次请求都是一次全新的前向，除了你这次传进去的上下文，它什么都不记得。所谓"记忆"要么是产品层把历史拼进 prompt，要么是外挂了检索/数据库。</p>
+<p><strong>7. "训练数据里有，所以它一定知道。"</strong>训练数据里确实有海量事实，但模型学到的是<strong>统计规律</strong>而不是数据库。低频事实很难被逐字记住，高频事实又容易和相似实体混淆（"某某是哪一年出生的"这类问题最容易错）。记忆与泛化是同一套参数在两种压力下的妥协。</p>
+<p><strong>8. "量化会让模型明显变笨。"</strong>4 bit 量化在大多数任务上掉点很小（几个百分点），但在数学、代码、长链推理上更敏感——因为这些任务对数值精度更挑剔。所以生产环境常见"权重量化 + KV cache 量化 + 关键层保留高精度"的混合方案。</p>
+<p><strong>9. "MoE 更便宜。"</strong>要分开看：MoE 的<strong>计算</strong>只走激活专家（DeepSeek-V3 671B 总参数、37B 激活，每 token 算力接近 37B 稠密模型），但<strong>显存</strong>要装下全部专家。它省的是算力，不是显存；而且路由不均衡、通信开销、训练不稳定都是额外的工程成本。</p>
+<p><strong>10. "推理模型的思考链就是它的真实推理过程。"</strong>思考链是<strong>生成出来的文本</strong>，不是内部计算的日志。模型完全可能在思考链里写一段"看起来合理"的推导，而真正的答案来自别处。所以 CoT 可以用来提升准确率，但不能当作可信的解释或审计依据。</p>
+<blockquote><p><strong>一个更隐蔽的误解</strong></p>
+<p>"开源模型 = 开源一切"。绝大多数"开源"只放权重（有时加推理代码），训练数据、数据配比、RL 细节通常不公开。真正可复现的开放模型（如 OLMo、Pythia）会连数据一起放出来，但数量很少。</p></blockquote>
+<h2>读完这份材料，你应该能回答</h2>
+<ol><li>给一个句子的 token id，手算出第 1 层第 1 个位置的 q、k、v，并说明为什么要除以 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1828em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8572em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-2.8172em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1828em;"><span></span></span></span></span></span></span></span></span>。</li><li>解释为什么 LayerNorm 放在子层之前（Pre-LN）比放在之后更容易训练深层网络。</li><li>写出 softmax 交叉熵对 logits 的梯度，并说明为什么它恰好是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">y</span></span></span></span>。</li><li>给定层数、d_model、KV 头数、上下文长度，估算 KV cache 的显存。</li><li>解释 prefill 和 decode 两种负载为什么一个吃算力、一个吃带宽。</li><li>说明 RLHF 里 KL 惩罚项在防止什么，以及 DPO 是怎么把它消掉的。</li><li>解释 GRPO 为什么可以不要价值模型，组内基线在估计什么。</li><li>说明"更长的思维链"为什么等价于"更深的计算"，以及它的代价。</li></ol>
+<h2>继续往下读</h2>
+<div class="tablewrap"><table><thead><tr><th>想深入的方向</th><th>推荐起点</th><th>对应本页章节</th></tr></thead><tbody><tr><td>架构原始论文</td><td>Attention Is All You Need（2017）</td><td>第 5–7 章</td></tr><tr><td>缩放与训练</td><td>GPT-3（2020）、Chinchilla（2022）</td><td>第 17 章</td></tr><tr><td>对齐</td><td>InstructGPT（2022）、DPO（2023）</td><td>第 17 章</td></tr><tr><td>推理模型</td><td>DeepSeek-R1（2025）、o1 技术报告</td><td>第 18 章</td></tr><tr><td>推理工程</td><td>FlashAttention（2022）、vLLM/PagedAttention（2023）</td><td>第 10 章</td></tr><tr><td>动手实现</td><td>nanoGPT、llm.c、本页第 19 章</td><td>第 19 章</td></tr></tbody></table></div>
+<blockquote><p><strong>收尾</strong></p>
+<p>大模型没有魔法。它是一串矩阵乘法、一个 softmax、一个交叉熵，加上足够多的数据和算力。真正难的从来不是某一个公式，而是让几万个矩阵乘法在几千张卡上稳定地跑几个月——以及判断它什么时候在胡说。前者是工程，后者是你读完这份材料后应该有的判断力。</p></blockquote>
+<blockquote><p><strong>关于本页的数字</strong></p>
+<p>第 4–9 章所有逐层演算的数字，都来自 <code>tools/toy_gpt.py</code> 训练出的 1608 参数模型，固定随机种子，可用 <code>tools/build.py</code> 重新生成。若你修改了代码并重新训练，页面上的数字会与你的模型不一致——这是预期的，也是这份材料想传递的一点：<strong>这些数字不是示意，是某一次真实前向的输出。</strong></p></blockquote>
+  <div class="pager"><a href="21-harness.html">← Harness：模型外面那一圈代码</a><a href="23-exercises.html" style="text-align:right">习题与动手实验 →</a></div>
+</main>
+</div>
+</body>
+</html>
