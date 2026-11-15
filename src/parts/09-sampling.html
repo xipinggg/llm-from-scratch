@@ -1,0 +1,155 @@
+<section class="chapter" id="ch09" data-num="09" data-title="选哪个字：温度、top-k、top-p" data-desc="从概率分布里抽样的全部工程细节" data-desc-note="">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第九章 · 解码与采样</div>
+    <h2>选哪个字：温度、top-k、top-p</h2>
+    <p class="lead">模型输出的是 17 个数，不是一个字。从"分布"到"实际生成的那个字符"，中间隔着采样策略。本章的三个旋钮——温度、top-k、top-p——决定了同一个模型是写得像教科书还是像醉汉。</p>
+  </div>
+
+  <h3>先看清分布的形状</h3>
+  <p>上下文越长、越确定，分布就越尖。以下四个上下文都来自同一个模型：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>上下文</th><th>前三个候选</th><th>熵</th><th>有效候选数</th></tr></thead>
+      <tbody>
+        <tr><td><code>the ␣</code></td><td>m 0.411、l 0.327、r 0.108</td><td>1.393</td><td>4.0</td></tr>
+        <tr><td><code>the cat ␣</code></td><td>s 0.567、a 0.205、r 0.132</td><td>1.217</td><td>3.4</td></tr>
+        <tr><td><code>a ␣</code></td><td>o 0.421、d 0.298、c 0.108</td><td>1.615</td><td>5.0</td></tr>
+        <tr><td><code>the cat sat on the ␣</code></td><td>l 0.569、m 0.426、g 0.005</td><td>0.710</td><td>2.0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>"有效候选数"是 \(e^{H}\)，熵的指数：它告诉你这个分布"实际上相当于在几个选项里挑"。可以看到，同样的模型在不同位置上的确定性差别很大——有的地方几乎只有一个选择，有的地方四个选项势均力敌。</p>
+
+  <h3>策略一：贪心，永远选最大</h3>
+  <p>最简单的做法是每次取概率最大的那个。这叫<b>贪心解码</b>（greedy），等价于温度趋近 0。</p>
+  <p>它的问题是<b>会卡进循环</b>。训练好的小模型贪心生成时输出过长这样：</p>
+
+  <pre class="code"><code>the cat sat.the dog cat sat.the dog dog sat.the dog og og t.the rate</code></pre>
+
+  <p>"the dog" 和 "sat.the" 反复出现，中间还出现了 "og og" 这种碎片。原因很直接：一旦进入某个高频短语，最可能的下一词就是把这个短语继续下去，而它又恰好把上下文推回同一个状态。语言模型的目标是"局部最可能"，不是"整体最好"。</p>
+
+  <div class="keyidea">
+    <b>贪心为什么不是最优</b>
+    <p>每一步都选最大概率，得到的是<b>每一步的局部最优</b>，不是整句话的全局最优。想求全局最优得做搜索（束搜索），但"整句话概率最大"往往对应最平庸、最重复的文本——因为模型见过的常见句子概率都高。开放式生成想要的是"合理且有变化"，这本身就是个采样的目标，不是优化的目标。</p>
+  </div>
+
+  <h3>策略二：温度</h3>
+  <p>温度在 softmax 之前作用：把 logits 除以 \(T\)，再归一化。</p>
+
+  <div class="equation">
+    \[ p_i = \frac{\exp(z_i/T)}{\sum_j \exp(z_j/T)} \]
+    <span class="eqno">9.1</span>
+  </div>
+
+  <p>\(T<1\) 会让分布更尖（大的更大、小的更小），\(T>1\) 会让分布更平（小概率事件有机会被选中），\(T\to 0\) 退化成贪心。用 <code>the ␣</code> 那组 logits 实测：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>温度</th><th>m</th><th>l</th><th>r</th><th>d</th><th>熵</th></tr></thead>
+      <tbody>
+        <tr><td>T = 0.3</td><td>0.673</td><td>0.313</td><td>0.008</td><td>0.006</td><td>0.70</td></tr>
+        <tr><td>T = 0.5</td><td>0.565</td><td>0.357</td><td>0.039</td><td>0.032</td><td>0.96</td></tr>
+        <tr><td><b>T = 1.0</b></td><td>0.411</td><td>0.327</td><td>0.108</td><td>0.098</td><td>1.39</td></tr>
+        <tr><td>T = 1.5</td><td>0.335</td><td>0.287</td><td>0.137</td><td>0.129</td><td>1.59</td></tr>
+        <tr><td>T = 2.0</td><td>0.291</td><td>0.259</td><td>0.149</td><td>0.142</td><td>1.71</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>注意 T=2.0 时前两名已经几乎相等，而 r、d 这类原本只有 10% 的选项爬到了 15%。温度不改变候选的<b>顺序</b>，只改变分布的<b>平坦程度</b>。</p>
+
+  <div class="warn">
+    <b>温度不能乱调</b>
+    <p>调高温度不是"更有创造力"，而是"更愿意接受低概率的词"。T 太高时模型会开始编造不存在的词、破坏语法；T 太低时文本会变得呆板重复。代码生成通常用 0.0–0.2，聊天 0.7–0.9，创意写作 1.0–1.2，是经验值而不是定律。</p>
+  </div>
+
+  <h3>策略三：top-k</h3>
+  <p>只保留概率最高的 \(k\) 个候选，其余概率清零，再在剩下的里面重新归一化并采样。</p>
+
+  <div class="calc">
+    <div class="calc-title">k=5 时（用 trace 那组极尖的分布）</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">原始前 5</div><div class="calc-val">a 0.9987、w 0.0009、. 0.0005、d 0.000005、l 0.000001</div></div>
+      <div class="calc-row"><div class="calc-label">剔除尾部</div><div class="calc-val">17 个候选里丢掉 12 个，剩下的 5 个重新归一化</div></div>
+      <div class="calc-row"><div class="calc-label">效果</div><div class="calc-val">在这个位置几乎没变化（本来就 99.9% 在 a）；在平坦的位置效果显著</div></div>
+    </div>
+  </div>
+
+  <p>top-k 的问题是 \(k\) 固定。分布很尖时 \(k=50\) 会放进一堆垃圾；分布很平时 \(k=5\) 又会砍掉合理选项。于是有了 top-p。</p>
+
+  <h3>策略四：top-p（核采样）</h3>
+  <p>把候选按概率从大到小排，累加，直到总和超过 \(p\)（比如 0.9），只保留这几个。"候选池的大小由分布自己决定"：</p>
+
+  <div class="calc">
+    <div class="calc-title">top-p = 0.9 在两组分布上的不同表现</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">尖分布 <code>the cat sat on the ␣</code></div><div class="calc-val">l 0.569 + m 0.426 = 0.995 &gt; 0.9 → 只保留 <b>2</b> 个候选</div></div>
+      <div class="calc-row"><div class="calc-label">平分布 <code>the ␣</code></div><div class="calc-val">m .411 + l .327 + r .108 + d .098 = 0.944 &gt; 0.9 → 保留 <b>4</b> 个</div></div>
+      <div class="calc-row"><div class="calc-label">更平的情形</div><div class="calc-val">候选很分散时，池子会自动变大，最多到整个词表</div></div>
+    </div>
+  </div>
+
+  <p>这就是核采样（nucleus sampling）的核心：<b>用累积概率而不是固定数量来划边界</b>。实践中常把 top-k 和 top-p 一起用：先 top-k 砍掉长尾，再 top-p 按形状收紧。本页的采样演示就是这个顺序。</p>
+
+  <div class="demo" data-demo="sampler">
+    <div class="demo-head">
+      <span class="badge">交互</span>
+      <b>亲手调一次采样</b>
+      <span class="hint">温度 / top-k / top-p</span>
+    </div>
+    <div class="demo-body">
+      <div class="controls">
+        <label class="ctl"><span>上下文</span><select id="sm-ctx"></select></label>
+        <label class="ctl"><span>温度 T</span><input id="sm-t" type="range" min="0.1" max="2" step="0.05" value="1"><b id="sm-t-out">1.00</b></label>
+        <label class="ctl"><span>top-k</span><input id="sm-k" type="range" min="1" max="17" step="1" value="17"><b id="sm-k-out">17</b></label>
+        <label class="ctl"><span>top-p</span><input id="sm-p" type="range" min="0.1" max="1" step="0.01" value="1"><b id="sm-p-out">1.00</b></label>
+      </div>
+      <div class="bars" id="sm-bars"></div>
+      <div class="demo-foot">
+        <button class="btn primary" id="sm-draw">抽一次</button>
+        <button class="btn" id="sm-reset">重置</button>
+        <span id="sm-note" class="hint"></span>
+      </div>
+      <div class="calc-note">灰色条是被 top-k / top-p 剔除的候选。注意温度只改变条的高低，不改变顺序；top-k 和 top-p 改变"池子"的范围。<b>抽一次</b>会按当前分布随机采样，被抽中的条会高亮。</div>
+    </div>
+  </div>
+
+  <h3>束搜索：为什么大模型很少用</h3>
+  <p>束搜索（beam search）同时保留 \(B\) 条候选序列，每步扩展所有候选再选概率乘积最高的 \(B\) 条。它在机器翻译里是标配——因为"最可能的译文"确实是好译文。</p>
+  <p>但在开放式生成里它有两个毛病：</p>
+  <ul>
+    <li><b>长度偏置</b>。概率是乘出来的，序列越长概率越低，束搜索天然偏好短句；</li>
+    <li><b>平庸化</b>。最大化整句概率会收敛到"最安全"的表达，读起来毫无信息量。</li>
+  </ul>
+  <p>所以聊天、写作、代码补全一律用采样。只有在需要"确定性输出"时才会用贪心或低温采样。</p>
+
+  <h3>重复惩罚</h3>
+  <p>采样仍可能陷入重复。一个简单有效的补丁是：在 softmax 之前，把<b>已经出现过的 token</b> 的 logit 减去一个惩罚项。按出现次数扣分叫频率惩罚（frequency penalty），按是否出现扣分叫存在惩罚（presence penalty）。</p>
+
+  <p>这相当于人为修改了模型给出的分布——它已经不是"模型认为的概率"了。所以惩罚系数通常很小（0.1–1.0），调大了会让模型刻意回避正确的高频词。</p>
+
+  <h3>为什么同一个 prompt 两次回答不同</h3>
+  <p>因为采样是随机的。即使温度很低，只要不是 0，就有非零概率抽到别的 token；一旦某一个 token 不同，后面的整条轨迹就完全不同——这就是自回归的<b>蝴蝶效应</b>。即使把温度设为 0，服务端也可能因为浮点运算顺序、批处理的动态形状、多卡通信的归约顺序而产生微小差异，偶尔让两个 logit 交换名次。</p>
+
+  <div class="calc">
+    <div class="calc-title">常见参数对应的行为</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">T=0（或 0.01）</div><div class="calc-val">几乎确定，适合抽取结构化信息、代码、数学</div></div>
+      <div class="calc-row"><div class="calc-label">T=0.7, top-p=0.9</div><div class="calc-val">聊天默认，兼顾稳定与变化</div></div>
+      <div class="calc-row"><div class="calc-label">T=1.0–1.2, top-p=0.95</div><div class="calc-val">创意写作，接受更多低概率用词</div></div>
+      <div class="calc-row"><div class="calc-label">T=1.5+</div><div class="calc-val">大概率开始语无伦次，慎用</div></div>
+    </div>
+  </div>
+
+  <div class="keyidea">
+    <b>小结</b>
+    <p>模型给出一个分布，采样器决定从里面怎么取。温度改变形状，top-k 和 top-p 改变候选范围，束搜索改变搜索目标。这三件事弄明白，就能解释为什么同一个模型换一套参数，读起来像两个人写的。</p>
+  </div>
+
+  <div class="note">
+    <b>下一章</b>
+    <p>到这里，一次推理的数学过程完整了。但真实的推理服务要同时服务成百上千个用户，还要在几十毫秒内返回。第 10 章讲工程：KV cache、FlashAttention、量化、投机解码、连续批处理。</p>
+  </div>
+</section>

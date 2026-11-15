@@ -1,0 +1,61 @@
+vocab: ␣.acdeghilmnorstw V = 17
+corpus chars: 775  distinct: 17
+gradient check: worst relative error = 3.15e-07
+step   250  loss 1.8685
+step   500  loss 0.8063
+step   750  loss 0.6277
+step  1000  loss 0.5284
+step  1250  loss 0.4590
+step  1500  loss 0.4132
+step  1750  loss 0.3824
+step  2000  loss 0.3561
+step  2250  loss 0.3372
+step  2500  loss 0.3244
+step  2750  loss 0.3155
+step  3000  loss 0.3056
+step  3250  loss 0.2937
+step  3500  loss 0.2846
+step  3750  loss 0.2769
+step  4000  loss 0.2721
+step  4250  loss 0.2637
+step  4500  loss 0.2560
+step  4750  loss 0.2555
+step  5000  loss 0.2492
+step  5250  loss 0.2453
+step  5500  loss 0.2406
+step  5750  loss 0.2362
+step  6000  loss 0.2325
+step  6250  loss 0.2272
+step  6500  loss 0.2250
+step  6750  loss 0.2221
+step  7000  loss 0.2170
+step  7250  loss 0.2161
+step  7500  loss 0.2124
+step  7750  loss 0.2087
+step  8000  loss 0.2085
+step  8250  loss 0.2045
+step  8500  loss 0.2021
+step  8750  loss 0.1990
+step  9000  loss 0.1977
+step  9250  loss 0.1951
+step  9500  loss 0.1916
+step  9750  loss 0.1924
+step 10000  loss 0.1909
+step 10250  loss 0.1868
+step 10500  loss 0.1880
+step 10750  loss 0.1859
+step 11000  loss 0.1834
+step 11250  loss 0.1845
+step 11500  loss 0.1832
+step 11750  loss 0.1847
+step 12000  loss 0.1812
+
+final train loss 0.182  ppl 1.2
+the  -> [('m', 0.411), ('l', 0.327), ('r', 0.108), ('d', 0.098)]
+the cat  -> [('s', 0.567), ('a', 0.205), ('r', 0.132), ('i', 0.049)]
+the cat sat on the  -> [('l', 0.569), ('m', 0.426), ('g', 0.005), ('c', 0.0)]
+a  -> [('o', 0.421), ('d', 0.298), ('c', 0.108), ('r', 0.041)]
+
+sample: 'the cat sat.the dog cat sat.the dog dog sat.the dog og og t.the rate'
+trace ctx: the cat sat on the m -> next: [('a', 0.99865), ('w', 0.00088), ('.', 0.00046), ('s', 0.0)]
+wrote build/numbers.json

@@ -1,0 +1,119 @@
+<section class="chapter" id="ch01" data-num="01" data-title="全景：一次推理的七个阶段" data-desc="从字符串到概率分布，先看完整流程再拆开" data-desc-note="">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第一章 · 全景</div>
+    <h2>全景：一次推理的七个阶段</h2>
+    <p class="lead">先把整条路走一遍。你现在不需要懂任何细节，只需要记住"输入是什么、输出是什么、中间被改写了多少次"。后面每一章会把其中一段放大一千倍。</p>
+  </div>
+
+  <p>假设你对模型说 <span class="tok">the cat sat on the m</span>。模型要做的，是给出下一个字符。它最后吐出的答案是 <span class="tok alt">a</span>，并声称这个答案的概率是 99.87%。</p>
+
+  <p>从你按下回车到看见这个 <b>a</b>，中间发生了七件事：</p>
+
+  <ol class="steps">
+    <li><b>分词</b>　把字符串切成模型认识的离散单元（token），查表换成整数 ID。20 个字符 → 20 个整数。</li>
+    <li><b>嵌入 + 位置</b>　每个 ID 查一张 17×8 的表得到 8 维向量；再加一个表示"你在第几个位置"的向量。此时形状是 <span class="shape">[20, 8]</span>。</li>
+    <li><b>注意力</b>　每个位置向所有更早的位置发问，按相关性取回信息，改写自己的向量。形状不变。</li>
+    <li><b>前馈网络</b>　每个位置独立地做一次"升维 → 非线性 → 降维"。形状不变。</li>
+    <li><b>重复 2 层</b>　第 3、4 步合起来叫一个 Transformer 块。这个模型堆了 2 块。</li>
+    <li><b>输出投影</b>　把<em>最后一个位置</em>的 8 维向量映射成 17 个数（logits），每个数对应一个候选字符。</li>
+    <li><b>softmax + 采样</b>　17 个 logits 变成 17 个概率，从里面抽一个。抽到 <b>a</b>。</li>
+  </ol>
+
+  <figure class="figure">
+    <div class="figbox">
+      <svg viewBox="0 0 720 250" role="img" aria-label="一次推理的流程图">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path>
+          </marker>
+          <style>
+            .fb { fill: var(--surface-2); stroke: var(--rule-strong); stroke-width: 1; }
+            .fl { fill: var(--ink); font: 600 12px var(--sans); }
+            .fs { fill: var(--muted); font: 10.5px var(--mono); }
+            .fa { stroke: var(--faint); stroke-width: 1.2; fill: none; marker-end: url(#ar); color: var(--faint); }
+            .fh { fill: var(--accent); }
+            .fh2 { fill: var(--accent-2); }
+          </style>
+        </defs>
+        <rect class="fb" x="8" y="96" width="92" height="44" rx="8"></rect>
+        <text class="fl" x="54" y="115" text-anchor="middle">the cat…</text>
+        <text class="fs" x="54" y="131" text-anchor="middle">字符串</text>
+        <path class="fa" d="M 100 118 L 128 118"></path>
+        <rect class="fb" x="128" y="96" width="86" height="44" rx="8"></rect>
+        <text class="fl" x="171" y="115" text-anchor="middle">15 7 5 0…</text>
+        <text class="fs" x="171" y="131" text-anchor="middle">token ID</text>
+        <path class="fa" d="M 214 118 L 242 118"></path>
+        <rect class="fb" x="242" y="96" width="94" height="44" rx="8"></rect>
+        <text class="fl" x="289" y="115" text-anchor="middle">[20, 8]</text>
+        <text class="fs" x="289" y="131" text-anchor="middle">嵌入 + 位置</text>
+        <path class="fa" d="M 336 118 L 364 118"></path>
+
+        <rect class="fb" x="364" y="42" width="264" height="152" rx="12" fill="var(--surface)"></rect>
+        <text class="fs" x="380" y="62">× 2 个 Transformer 块</text>
+        <rect class="fb" x="380" y="72" width="106" height="48" rx="8"></rect>
+        <text class="fl" x="433" y="92" text-anchor="middle">注意力</text>
+        <text class="fs" x="433" y="108" text-anchor="middle">[20,8] → [20,8]</text>
+        <rect class="fb" x="380" y="132" width="106" height="48" rx="8"></rect>
+        <text class="fl" x="433" y="152" text-anchor="middle">前馈网络</text>
+        <text class="fs" x="433" y="168" text-anchor="middle">8 → 16 → 8</text>
+        <rect class="fb" x="506" y="72" width="106" height="48" rx="8"></rect>
+        <text class="fl" x="559" y="92" text-anchor="middle">残差 + LN</text>
+        <text class="fs" x="559" y="108" text-anchor="middle">形状不变</text>
+        <rect class="fb" x="506" y="132" width="106" height="48" rx="8"></rect>
+        <text class="fl" x="559" y="152" text-anchor="middle">残差 + LN</text>
+        <text class="fs" x="559" y="168" text-anchor="middle">形状不变</text>
+        <path class="fa" d="M 486 96 L 486 126" marker-end="url(#ar)"></path>
+        <path class="fa" d="M 486 152 L 486 180 L 380 180 L 380 96" marker-end="url(#ar)"></path>
+
+        <path class="fa" d="M 628 118 L 656 118"></path>
+        <rect class="fb" x="656" y="86" width="56" height="64" rx="8"></rect>
+        <text class="fl" x="684" y="106" text-anchor="middle">17</text>
+        <text class="fs" x="684" y="122" text-anchor="middle">logits</text>
+        <text class="fs" x="684" y="137" text-anchor="middle">softmax</text>
+
+        <path class="fa" d="M 684 150 L 684 190 L 433 190 L 433 202" marker-end="url(#ar)"></path>
+        <rect class="fh" x="364" y="202" width="140" height="34" rx="8" opacity=".12"></rect>
+        <text class="fl" x="434" y="224" text-anchor="middle">a · p = 0.9987</text>
+        <text class="fs" x="520" y="224">← 采样</text>
+      </svg>
+    </div>
+    <figcaption><b>图 1-1</b>　一次前向传播。注意这里容易误解：20 个字符全都参与了计算，但输出只用了<b>最后一个位置</b>的向量。前面 19 个位置的向量唯一的作用，是在注意力和前馈层里把自己的信息汇入最后一格。</figcaption>
+  </figure>
+
+  <div class="keyidea">
+    <b>一个容易忽略的事实</b>
+    <p>整个模型里没有任何一个操作用到了"循环"或"递归"。一次前向传播就是几十次矩阵乘法加若干逐元素运算。所谓"深度"，是这些运算串起来的层数；所谓"宽度"，是每一层向量的维度。</p>
+  </div>
+
+  <h3>这 1608 个参数都花在哪了</h3>
+  <p>后面每次看到具体数字，你都可以回到这张表来对账。参数量小得可以在纸上抄完：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>参数</th><th>形状</th><th class="num">数量</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>wte</code></td><td>[17, 8]</td><td class="num">136</td><td>字符嵌入表：每个字符一行 8 维向量</td></tr>
+        <tr><td><code>wpe</code></td><td>[40, 8]</td><td class="num">320</td><td>可学习的位置嵌入：每个位置一行</td></tr>
+        <tr><td>每层注意力</td><td>4 × [8, 8] + 2 × [8]</td><td class="num">272</td><td>Q/K/V/O 四个投影 + 两个 LayerNorm 的缩放与偏置</td></tr>
+        <tr><td>每层前馈</td><td>[8,16] + [16] + [16,8] + [8] + 2×[8]</td><td class="num">296</td><td>升维、GELU、降维 + 两个 LayerNorm</td></tr>
+        <tr><td>最终 LayerNorm</td><td>2 × [8]</td><td class="num">16</td><td>输出前的最后一次归一化</td></tr>
+        <tr><td colspan="2"><b>合计</b></td><td class="num"><b>1608</b></td><td>嵌入 456 + 2 层 × 568 + 16</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>有两个数字值得先留意，它们按比例放到 GPT-4 上依然成立：<b>位置嵌入占了 320 个参数，是整个模型里最大的一块</b>（因为上下文长度 40 比词表 17 还大）；<b>每层里前馈网络的参数（296）比注意力（272）还多</b>，这个比例在后面的大模型里一直保持。</p>
+
+  <h3>两次"推理"其实是两种不同的负载</h3>
+  <p>上图中的流程要跑 20 次——不是每次生成一个字符就重跑 20 个位置，而是：</p>
+  <ul>
+    <li><b>预填充（prefill）</b>：把 <span class="tok">the cat sat on the m</span> 的 20 个位置<b>一次性并行</b>送进网络，得到 20 组中间状态，顺带把每个位置的 Key/Value 存起来。这一步是"一大块矩阵乘法"，GPU 很擅长。</li>
+    <li><b>解码（decode）</b>：每生成一个新字符，只把<b>这一个</b>新位置送进网络，attention 时从缓存里读回前面所有位置的 Key/Value。这一步每次只算一个向量，是"访存密集型"的。</li>
+  </ul>
+  <p>第 10 章会把这件事算成显存和带宽的账。现在只需要知道：<b>同一个模型、同一段文字，prefill 和 decode 的硬件瓶颈完全不同</b>，几乎所有推理优化都围绕这个分裂展开。</p>
+
+  <div class="note">
+    <b>为什么输出只取最后一个位置</b>
+    <p>因为语言模型的定义就是"给定前缀，预测下一个 token"。中间的 19 个位置也在被训练——训练时每个位置都有一个"应该预测的下一个字符"作为监督信号，这叫<b>并行训练</b>。但在真正生成时，我们只关心最后一格。第 8 章会展示每个位置各自的预测结果，你会发现第 3 个位置的模型其实在猜 "cat" 后面接什么。</p>
+  </div>
+</section>

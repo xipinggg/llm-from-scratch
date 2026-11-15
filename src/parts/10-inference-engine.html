@@ -1,0 +1,255 @@
+<section class="chapter" id="ch10" data-num="10" data-title="推理引擎：把 FLOPs 变成毫秒" data-desc="prefill 与 decode 各自动作、roofline、FlashAttention、量化、投机解码、连续批处理与混合批次">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第十章 · 推理工程</div>
+    <h2>推理引擎：把 FLOPs 变成毫秒</h2>
+    <p class="lead">数学上，生成一个 token 就是一次前向传播。工程上，这次前向要真金白银地占显存、搬数据、排队等待。这一章讲一次请求从进 GPU 到吐出第一个字的全过程：为什么大模型解码<b>不是算力瓶颈而是显存带宽瓶颈</b>，以及行业为此积累下来的四类优化手段。KV cache 的细账（GQA/MLA、分页、前缀缓存、量化、淘汰）单独放在第 11 章，因为它是这一章里最贵、也最值得展开的一部分。</p>
+  </div>
+
+  <h3>两个完全不同的阶段</h3>
+  <p>一次对话的推理分成两段，它们的性能特征截然相反：</p>
+
+  <div class="compare">
+    <div>
+      <h4>Prefill（预填充）</h4>
+      <p>把你的整段输入一次性送进模型。<b>T 个 token 并行计算</b>，每个权重被用 T 次，GPU 的算力被吃满。这一阶段是<b>计算密集</b>的，耗时随输入长度线性增长，但吞吐很高。它决定了用户等待第一个字的时长。</p>
+    </div>
+    <div>
+      <h4>Decode（解码）</h4>
+      <p>每次只生成一个 token。<b>一次前向只为 1 个位置服务</b>，但要把整个模型的权重从显存读一遍。算力几乎闲着，全在等数据搬运。这一阶段是<b>带宽密集</b>的，也是用户感知到的"打字速度"。</p>
+    </div>
+  </div>
+
+  <p>这个差别带来一个不太直观的结论：<b>单个用户解码时，GPU 的算力利用率只有百分之几</b>——时间几乎全花在把权重从显存搬到计算单元上。下面把这一步算一遍。</p>
+
+  <div class="calc">
+    <div class="calc-title">Llama 3 8B 的单流解码上限</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">权重（FP16）</div><div class="calc-val">8.0e9 × 2 字节 = <span class="pos">16.0 GB</span></div></div>
+      <div class="calc-row"><div class="calc-label">每 token 计算量</div><div class="calc-val">2 × 8.0e9 = 16 GFLOPs</div></div>
+      <div class="calc-row"><div class="calc-label">H100 计算时间</div><div class="calc-val">16e9 / 990e12 ≈ 16 μs</div></div>
+      <div class="calc-row"><div class="calc-label">H100 读取时间</div><div class="calc-val">16e9 / 3.35e12 ≈ 4.8 ms</div></div>
+      <div class="calc-row"><div class="calc-label">单流上限</div><div class="calc-val">1 / 4.8ms ≈ <b>208 token/s</b>（实际还要更低）</div></div>
+    </div>
+  </div>
+
+  <h3>两个延迟指标：TTFT 与 TPOT</h3>
+  <p>服务端不看"算力利用率"，看两个延迟指标：</p>
+  <ul>
+    <li><b>TTFT</b>（Time To First Token）：从请求到第一个 token 出现，由 prefill 决定。输入 2000 token、prefill 吞吐 5000 token/s 时，TTFT ≈ 0.4 秒。</li>
+    <li><b>TPOT</b>（Time Per Output Token）：之后每个 token 的间隔，由 decode 决定，也就是上面算出的 4.8 毫秒起步。TPOT 20ms 对应约 50 token/s 的"打字速度"。</li>
+  </ul>
+  <p>这两个指标对应两种完全不同的优化：<b>prefill 想提高算力利用率</b>（更大 batch、更长 chunk、FlashAttention），<b>decode 想减少每步搬运的字节</b>（量化、GQA、更小的模型、投机解码）。把它们混为一谈，就会得出"换个更快的 GPU 就能让每个用户都快 3 倍"这种错误结论。</p>
+
+
+  <h3>prefill 阶段：从一个请求进来到第一个 token</h3>
+  <p>把引擎想象成一条流水线。一个 prefill 请求进来，管线要做九件事；任何一件做错，表现出来的都是 TTFT 变长，或者直接报错。</p>
+  <ol class="steps">
+    <li><b>接入与分词</b>　tokenize 成 \(T\) 个 id，校验 <code>max_model_len</code> 与上下文长度，分配请求 id、采样参数、停止条件。</li>
+    <li><b>前缀缓存查询</b>　按块哈希去查已有的 KV 块（第 11 章）。命中的块直接挂到请求的 block table，只对未命中的后缀计算——命中 1800/2000，就等于少算 90% 的 prefill。</li>
+    <li><b>排队与预算</b>　进入等待队列。调度器按本步的 token 预算（<code>max_num_batched_tokens</code>，常见 8192）决定这次算多少；\(T\) 超过预算就切成多块（chunked prefill），先算第一块。</li>
+    <li><b>分配 KV 块</b>　按 \(\lceil T/16\rceil\) 个块申请（块大小 16 token，见第 11 章）。池里不够就排队，或者抢已经占着显存的请求。</li>
+    <li><b>组批与元数据</b>　把多个请求的 prefill 拼成一个变长 batch，用四张表描述：<code>query_start_loc</code>（哪几行属于哪个请求）、<code>seq_lens</code>（各自长度）、<code>block_tables</code>（逻辑块到物理块）、<code>slot_mapping</code>（本步往哪写 KV）。</li>
+    <li><b>执行前向</b>　\(M=T\) 的大 GEMM（QKV 投影、FFN）+ 分块因果注意力（第 13 章）；张量并行时每层两次 all-reduce。</li>
+    <li><b>只对最后一个位置采样</b>　logits → 温度 / top-k / top-p / 约束掩码 → 抽出第一个 token。前面 \(T-1\) 个位置只贡献 KV，不产生输出——第 8 章算过为什么可以只取最后一行。</li>
+    <li><b>写 KV、更新状态</b>　本步算出的 \(k,v\) 按 <code>slot_mapping</code> 写进物理块；<code>seq_len += T</code>，block table 追加。</li>
+    <li><b>流式返回</b>　detokenize 第一个 token 推给客户端（这就是 TTFT 的终点），请求转入 running 队列交给 decode。</li>
+  </ol>
+  <div class="calc">
+    <div class="calc-title">prefill 的一次算账（8B，T = 2000，单卡 H100）</div>
+    <div class="calc-row"><span class="calc-label">计算量</span><span class="calc-val">2 × 8.03e9 × 2000 ≈ 32.1 TFLOPs</span></div>
+    <div class="calc-row"><span class="calc-label">峰值时间</span><span class="calc-val">32.1e12 / 990e12 ≈ 32 ms（MFU 100%，做不到）</span></div>
+    <div class="calc-row"><span class="calc-label">现实时间</span><span class="calc-val">MFU 25%–40% → 80–130 ms</span></div>
+    <div class="calc-row"><span class="calc-label">访存</span><span class="calc-val">读 16.06 GB 权重 + 写 2000 × 128 KB = 256 MB KV</span></div>
+    <div class="calc-row"><span class="calc-label">算术强度</span><span class="calc-val">32.1e12 / 16.3e9 ≈ 1970 FLOP/B（脊点 295）</span></div>
+    <div class="calc-row"><span class="calc-label">结论</span><span class="calc-val">计算受限：把 GPU 的算力用满，是 prefill 唯一的优化目标</span></div>
+  </div>
+
+  <h3>decode 阶段：每五毫秒重复一次的那九件事</h3>
+  <p>decode 每一步只生成一个 token，却要重复同一套动作。它的九件事和 prefill 几乎一一对应，但每一件的成本结构完全相反。</p>
+  <ol class="steps">
+    <li><b>取活跃请求</b>　从 running 队列挑本步要算的 \(B\) 个请求。\(B\) 受两个东西限制：<code>max_num_seqs</code>，以及池里还有没有空余 KV 块。</li>
+    <li><b>分配新槽位</b>　每个请求需要 1 个新 token 的槽位；最后一块满了就申请一个新的物理块，写进 block table。</li>
+    <li><b>组装元数据</b>　<code>block_tables</code>、<code>seq_lens</code>、<code>slot_mapping</code>（每请求一项，指向本步要写的槽位）。</li>
+    <li><b>选图并重放</b>　按 \((num\_tokens=B,\ num\_reqs=B)\) 挑最近的分档 CUDA graph 直接重放（第 13 章）；形状不在任何一档就退回 eager，那一小批请求会明显变慢。</li>
+    <li><b>执行前向</b>　QKV 投影变成 \(B\) 行的瘦 GEMM/GEMV；注意力对每个请求读一遍 \(T\) 长度的 KV——这是整步的大头；FFN 同理。</li>
+    <li><b>采样</b>　\(B\) 个位置各抽一个 token（温度、top-k、top-p）；投机解码在这一步校验草稿（第 14 章）。</li>
+    <li><b>写 KV、更新长度</b>　把新 token 的 \(k,v\) 写进 <code>slot_mapping</code> 指定的槽位，<code>seq_len += 1</code>。</li>
+    <li><b>检查结束条件</b>　遇到 EOS、stop 串、<code>max_tokens</code> 就释放该请求的 KV 块、把它移出队列并返回结果。</li>
+    <li><b>处理显存不足</b>　池子满了就按策略抢占（第 12 章）：删掉某些请求的块、之后重算（RECOMPUTE），或换到 CPU（SWAP）。被抢占的请求会表现为"卡住一下"。</li>
+  </ol>
+  <div class="calc">
+    <div class="calc-title">decode 的一次算账（8B，T = 2000，每请求 128 KB/token）</div>
+    <div class="calc-row"><span class="calc-label">B = 1</span><span class="calc-val">读 16.32 GB → 4.87 ms → 205 tok/s</span></div>
+    <div class="calc-row"><span class="calc-label">B = 8</span><span class="calc-val">读 18.16 GB → 5.42 ms → 1476 tok/s</span></div>
+    <div class="calc-row"><span class="calc-label">B = 32</span><span class="calc-val">读 24.46 GB → 7.30 ms → 4384 tok/s</span></div>
+    <div class="calc-row"><span class="calc-label">B = 128</span><span class="calc-val">读 49.71 GB → 14.84 ms → 8625 tok/s</span></div>
+    <div class="calc-row"><span class="calc-label">算术强度</span><span class="calc-val">B=1 时 0.98 FLOP/B，B=32 时 21 FLOP/B，B=128 时 41 FLOP/B</span></div>
+    <div class="calc-row"><span class="calc-label">结论</span><span class="calc-val">带宽受限：所有优化都在减少"每步要读多少字节"</span></div>
+  </div>
+  <p>这张表解释了两个常见现象：单路 decode 只有 200 tok/s 左右（受带宽上限约束，与 GPU 算力无关）；而把 batch 拉到 32，总吞吐能到 4000+ tok/s——但单个用户感受到的间隔仍然是 7.3 ms/token。这就是第 12 章里"吞吐与延迟是两个目标"的来源。</p>
+
+  <h3>同一次前向，两种形状</h3>
+  <p>把两边的关键差异并排看。它们之所以需要两套 kernel、两套调参、甚至两套硬件，全在这张表里：</p>
+  <div class="tablewrap tight">
+    <table>
+      <thead><tr><th>维度</th><th>prefill</th><th>decode</th></tr></thead>
+      <tbody>
+        <tr><td>输入形状</td><td>\([T, d]\)，\(T\) 可达上万</td><td>\([B, 1, d]\)，每个请求一行</td></tr>
+        <tr><td>主要算子</td><td>大 GEMM + 因果分块注意力</td><td>瘦 GEMM/GEMV + 扫全历史 KV</td></tr>
+        <tr><td>算术强度</td><td>约 2000 FLOP/B</td><td>1–40 FLOP/B</td></tr>
+        <tr><td>受限资源</td><td>算力（MFU）</td><td>显存带宽（3.35 TB/s）</td></tr>
+        <tr><td>KV 行为</td><td>写入 \(T\) 个槽位</td><td>读 \(B\times T\) 个槽位 + 写 1 个</td></tr>
+        <tr><td>并行维度</td><td>序列长度、张量并行</td><td>批大小、KV 分区、上下文并行</td></tr>
+        <tr><td>关键指标</td><td>TTFT</td><td>TPOT / ITL</td></tr>
+        <tr><td>主要手段</td><td>FlashAttention、chunked prefill、前缀缓存</td><td>量化、GQA、投机解码、CUDA graph、大 batch</td></tr>
+        <tr><td>典型故障</td><td>长 prompt OOM、TTFT 毛刺</td><td>带宽打满、ITL 抖动、KV 池满被抢占</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>混合批次：引擎怎么同时做这两件事</h3>
+  <p>真实服务里两者永远同时在跑：有人在等第一个字（prefill），有人在等下一个字（decode）。引擎不会为它们开两个进程，而是把两类请求拼进<b>同一个批次</b>。做法和代价都很具体：</p>
+  <ul>
+    <li><b>预算切分</b>　每一步的 token 预算先分给 decode（每个请求 1 个 token），剩下的才给 prefill 的块。这就是第 12 章那条"先 decode、后 prefill"的调度规则。</li>
+    <li><b>块的粒度决定抖动</b>　chunk 越大，TTFT 越低，但一步里塞的 prefill token 越多，正在解码的用户那一拍就被拖长。按 8B 单卡约 15000 tok/s 的 prefill 吞吐估：chunk 8192 ≈ 546 ms 的 ITL 毛刺，2048 ≈ 137 ms，这也是生产上多半取 2048–8192 的原因。</li>
+    <li><b>kernel 要能吃"不统一的 batch"</b>　同一批里有的 query 长度是 1（decode）、有的是几千（prefill chunk），注意力 kernel 必须支持这种混合形状；支持不好的后端会被拆成两个 kernel，两次启动、两倍开销（第 13 章的能力枚举）。</li>
+    <li><b>CUDA graph 不友好</b>　混合批次的形状组合太多，很难逐个捕获；很多引擎在混合批时回落到 eager，或者只对纯 decode 批启用图——这也是"纯 decode 批"在某些引擎里反而更快的隐藏原因。</li>
+  </ul>
+  <p>把这一节和上面两张表合起来看，prefill/decode 的"原理"其实就一句话：<b>同一个模型、同一套权重、两种完全不同的算术形状</b>。引擎的所有动作——排队、切块、分块、组批、选图、抢占——都是在给这两种形状找各自的资源。</p>
+
+  <h3>roofline：算术强度决定瓶颈</h3>
+  <p>一个计算任务到底卡在算力还是带宽，可以用一个比值判断：<b>算术强度</b>（arithmetic intensity），即每搬运 1 字节数据做了多少次浮点运算。</p>
+
+  <div class="equation">
+    \[ I = \frac{\text{FLOPs}}{\text{Bytes}} \qquad \text{可达性能} = \min\big(\text{峰值算力},\ I \times \text{带宽}\big) \]
+    <span class="eqno">10.1</span>
+  </div>
+
+  <p>把峰值算力和带宽的比值叫"脊点"（ridge point）。H100 的 FP16 峰值 990 TFLOPS、HBM 带宽 3.35TB/s，脊点 ≈ 295 FLOP/字节。算术强度低于它的任务<b>带宽受限</b>（曲线贴着带宽那条斜线），高于它的任务<b>算力受限</b>（曲线被算力上限压平）。</p>
+
+  <figure class="figure">
+    <div class="figbox">
+      <svg viewBox="0 0 640 280" role="img" aria-label="H100 的 roofline 曲线">
+        <line x1="40" y1="240" x2="620" y2="240" stroke="var(--rule)" stroke-width="1"/>
+        <line x1="40" y1="240" x2="40" y2="20" stroke="var(--rule)" stroke-width="1"/>
+        <polyline points="40,208 527,39 620,39" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <line x1="527" y1="39" x2="527" y2="240" stroke="var(--rule)" stroke-dasharray="4 4"/>
+        <circle cx="87" cy="192" r="4" fill="var(--wolf)"/>
+        <text x="97" y="188" font-size="11" fill="var(--ink)">batch=1（AI 0.9）</text>
+        <circle cx="270" cy="128" r="4" fill="var(--wolf)"/>
+        <text x="280" y="124" font-size="11" fill="var(--ink)">batch=32（AI 10.2）</text>
+        <text x="519" y="232" font-size="11" fill="var(--muted)" text-anchor="end">脊点 295</text>
+        <text x="200" y="228" font-size="11" fill="var(--muted)">带宽受限：性能 = 3.35 × AI</text>
+        <text x="545" y="70" font-size="11" fill="var(--muted)" text-anchor="end">算力受限：990 TFLOPS</text>
+        <text x="620" y="262" font-size="11" fill="var(--muted)" text-anchor="end">算术强度（FLOP/字节，对数轴）→</text>
+        <text x="34" y="30" font-size="11" fill="var(--muted)" text-anchor="end">TFLOPS</text>
+      </svg>
+    </div>
+    <figcaption>图 10-1　H100 上的 roofline。解码时 batch=1 的两个点都贴在斜线上：无论 GPU 算力多高，速度都由带宽决定。只有把 batch 做大、算术强度推过脊点，GPU 的算力才真正开始工作。</figcaption>
+  </figure>
+
+  <p>把解码的具体数字代进去，结论很残酷：</p>
+
+  <div class="calc">
+    <div class="calc-title">Llama 3 8B 在 8K 上下文下的算术强度</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">每步读取字节</div><div class="calc-val">权重 16.0GB + batch × 1.07GB（KV cache）</div></div>
+      <div class="calc-row"><div class="calc-label">batch = 1</div><div class="calc-val">FLOPs 16G / 字节 17.1G = <b>0.9</b> FLOP/字节</div></div>
+      <div class="calc-row"><div class="calc-label">batch = 32</div><div class="calc-val">FLOPs 512G / 字节 50.4G = <b>10.2</b> FLOP/字节</div></div>
+      <div class="calc-row"><div class="calc-label">离脊点多远</div><div class="calc-val">还差 29–330 倍，所以 decode 永远是带宽受限</div></div>
+      <div class="calc-row"><div class="calc-label">推论</div><div class="calc-val">想让解码变快，只能<b>减少搬运的字节</b>，不能指望换更强的算力卡</div></div>
+    </div>
+  </div>
+
+  <h3>FlashAttention：注意力分块算</h3>
+  <p>标准注意力要把 \(T\times T\) 的分数矩阵写回显存再读出来做 softmax。T=8192 时，这个矩阵有 6700 万个元素，每层、每个头都要读写一遍，显存带宽全耗在搬运中间结果上——而 prefill 恰恰是算力密集的，带宽被中间矩阵吃掉，性价比很差。更糟的是 \(O(T^2)\) 的显存直接爆掉。</p>
+
+  <p>FlashAttention 的做法是<b>分块 + 在线 softmax</b>：把 K、V 切成能放进 SRAM 的小块，逐块算分数、逐块更新 softmax 的分子分母和当前输出。全程只保留一个"运行中的最大值和归一化因子"，\(T\times T\) 矩阵<b>从不落地</b>。</p>
+
+  <div class="equation">
+    \[ m^{(j)} = \max\big(m^{(j-1)},\, \max_i z_i\big),\qquad \ell^{(j)} = e^{m^{(j-1)}-m^{(j)}}\ell^{(j-1)} + \sum_i e^{z_i-m^{(j)}} \]
+    <span class="eqno">10.2</span>
+  </div>
+
+  <p>这个公式是 FlashAttention 的核心：最大值更新后，旧的累加和要按新的最大值重新缩放。数学上和一次性 softmax 完全等价，只是把"先全部算完再归一化"改成了"边算边归一化"。注意它是<b>精确的同一计算</b>，不是近似。</p>
+
+  <div class="calc">
+    <div class="calc-title">算法收益</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">显存</div><div class="calc-val">从 \(O(T^2)\) 降到 \(O(T)\)——只需要存 K、V 和输出</div></div>
+      <div class="calc-row"><div class="calc-label">HBM 读写</div><div class="calc-val">从 \(O(T^2)\) 降到 \(O(T^2 d / M)\)（M 是 SRAM 大小），实际减少数倍</div></div>
+      <div class="calc-row"><div class="calc-label">实测</div><div class="calc-val">prefill 阶段 2–4 倍加速，长上下文更明显</div></div>
+      <div class="calc-row"><div class="calc-label">代价</div><div class="calc-val">反向传播要重算（recomputation），训练时用算力换显存</div></div>
+      <div class="calc-row"><div class="calc-label">decode 变体</div><div class="calc-val">FlashDecoding：把历史 K/V 切块并行，解决单 query 时 GPU 核心闲置</div></div>
+    </div>
+  </div>
+
+  <h3>量化：把字节数降下来</h3>
+  <p>既然瓶颈是"读权重"，那把权重存小一点就直接提速。量化把浮点数换成低精度整数：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>格式</th><th>每参数位数</th><th>8B 模型权重</th><th>相对 FP16</th><th>典型场景</th></tr></thead>
+      <tbody>
+        <tr><td>FP16 / BF16</td><td>16</td><td>16 GB</td><td>1×</td><td>训练、精度敏感推理</td></tr>
+        <tr><td>FP8</td><td>8</td><td>8 GB</td><td>2×</td><td>H100 原生支持，几乎无损</td></tr>
+        <tr><td>INT8</td><td>8</td><td>8 GB</td><td>2×</td><td>通用推理</td></tr>
+        <tr><td>INT4（GPTQ/AWQ）</td><td>4</td><td>4 GB</td><td>4×</td><td>单卡部署、端侧</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>量化的难点不是"把数字变小"，而是"变小之后精度不崩"。两种主流做法：</p>
+  <ul>
+    <li><b>GPTQ</b>：逐层做，用一小批校准数据，最小化量化误差对输出的影响（二阶信息）；</li>
+    <li><b>AWQ</b>：观察到只有约 1% 的"显著权重"重要，按激活幅度找出它们并保护，其余大胆量化。</li>
+  </ul>
+  <p>注意量化的收益和 batch 有关：权重占读取量的大头时（batch 小、上下文短），4bit 几乎能把解码速度提到 4 倍；但当 batch 很大、KV cache 读取占据主导时，<b>只量化权重就不够了</b>，得连 KV cache 一起量化——那是第 11 章的主题。</p>
+
+  <h3>投机解码：小模型先试写</h3>
+  <p>解码慢是因为"一次只生成一个 token，却要读一遍全部权重"。投机解码（speculative decoding）的思路是：让一个小模型（草稿模型）快速猜出接下来 4 个 token，然后让大模型<b>一次前向并行验证这 4 个</b>。验证的计算量和生成 1 个差不多（因为都是一次前向），但可能一次接受多个。</p>
+
+  <div class="equation">
+    \[ \text{speedup} \approx \frac{1-\alpha^{k+1}}{(1-\alpha)(1+kc)} \]
+    <span class="eqno">10.3</span>
+  </div>
+
+  <p>其中 \(\alpha\) 是草稿被接受的概率，\(k\) 是每轮猜几个，\(c\) 是草稿模型相对大模型的开销比例。取 \(\alpha=0.8\)、\(k=4\)、\(c=0.05\)，加速比约 2.6 倍。<b>关键性质：输出分布和原模型完全一致</b>——它不是近似，是用拒绝采样保证等价。</p>
+
+  <p>草稿不一定是另一个模型。也可以用同一模型的低精度版本、n-gram 查表、甚至"提示词里已有的片段"来猜，这类方法统称 draft-free 投机解码。还有一类做法（Medusa、EAGLE）是在模型上挂几个额外的预测头，一次吐出多个位置的候选，再用树状注意力并行验证——本质相同，都是"用并行验证换串行生成"。</p>
+
+  <p>要注意它的收益是有条件的：<b>batch 越大，投机解码的收益越小</b>。因为大 batch 下 GPU 已经被"多个用户的解码"填满，空出来的算力变少，而投机解码吃的正是空闲算力。</p>
+
+  <h3>连续批处理与调度</h3>
+  <p>传统批处理要求一个 batch 里所有请求同时开始、同时结束。但生成任务的输出长度差别极大，短请求完成后 GPU 就在等长请求，利用率暴跌。</p>
+
+  <p>连续批处理（continuous batching）把调度粒度从"请求"降到"每一步"：某个请求生成完就立刻退出，队列里的新请求立刻补进空位。配合 PagedAttention，显存也能按块回收。这是 vLLM、TensorRT-LLM、SGLang 吞吐提升 10 倍以上的主要原因。</p>
+
+  <p>调度器在做的事，是在三个约束之间找平衡：显存能装下多少条序列、算力每步能算多少 token、用户能忍受多长的等待。</p>
+  <ul>
+    <li><b>显存</b>：KV cache 决定了每张卡能挂多少个序列（第 11 章会给出可并发数的公式）；</li>
+    <li><b>公平</b>：新请求的 prefill 会打断正在解码的请求，造成 TPOT 抖动，所以有了 <b>chunked prefill</b>（把长输入切成小块，和解码混在一起跑）；</li>
+    <li><b>回收</b>：显存不够时不是杀掉请求，而是 <b>preemption</b>——把某个请求的 KV 换出到 CPU（swap）或直接丢掉重算（recompute）。长上下文请求重算很贵，所以工业系统通常优先换出短请求。</li>
+  </ul>
+
+  <div class="calc">
+    <div class="calc-title">一次真实服务的成本（数量级估算）</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">模型</div><div class="calc-val">Llama 3 8B，FP16，16GB 权重</div></div>
+      <div class="calc-row"><div class="calc-label">单卡 H100 80GB</div><div class="calc-val">权重 16GB + KV cache 最多约 60GB</div></div>
+      <div class="calc-row"><div class="calc-label">8K 上下文的并发数</div><div class="calc-val">60GB / 1.07GB ≈ 56 路（再留激活与碎片，实际按 50 路以内规划）</div></div>
+      <div class="calc-row"><div class="calc-label">批量解码吞吐</div><div class="calc-val">单流 200 token/s 的带宽上限，40 路分摊后每路约 5 token/s——但总吞吐仍约 200 token/s</div></div>
+      <div class="calc-row"><div class="calc-label">结论</div><div class="calc-val">批处理不提高单用户速度，只提高总吞吐；降低延迟要靠更小的模型、更低精度或更高带宽</div></div>
+    </div>
+  </div>
+
+  <div class="keyidea">
+    <b>小结</b>
+    <p>prefill 是算力密集，decode 是带宽密集，解码几乎总贴在 roofline 的斜线上。后面的四种手段各自换掉一样东西：FlashAttention 换执行顺序，让 \(T\times T\) 的矩阵不落地；量化换精度，少读字节；投机解码换并行，用小模型猜、大模型验；连续批处理换调度，把总带宽切成很多条流。它们互不冲突，可以叠加，但权重用量化与投机解码的收益都会随 batch 变大而衰减。KV cache 是这一切背后的隐形成本，第 11 章单独拆开讲。</p>
+  </div>
+
+  <div class="note">
+    <b>下一章</b>
+    <p>这一章反复提到，能缓存多少直接决定了服务的并发和延迟。第 11 章把它单独拆开：为什么它的大小是 \(2\times L\times H_{kv}\times d\times T\times b\) 字节，GQA 和 MLA 怎么把它压小 4–8 倍，分页、前缀缓存、量化、淘汰各自省的是哪一部分。</p>
+  </div>
+</section>

@@ -1,0 +1,149 @@
+<section class="chapter" id="ch16" data-num="16" data-title="架构变体：MoE、MLA、Mamba 与 MTP" data-desc="混合专家路由与负载均衡、MLA 的低秩 KV、滑窗与线性注意力的取舍、多 token 预测、归一化与激活的演进，以及没有变的部分">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第十六章 · 架构变体</div>
+    <h2>架构变体：MoE、MLA、Mamba 与 MTP</h2>
+    <p class="lead">前面所有章节都默认模型是一个稠密 Transformer。现在主流的大模型已经不是了：DeepSeek-V3 每次推理只激活 37B 参数、KV cache 只有同样规模 MHA 的 1/57，Gemma 与 Mistral 在层之间混用滑窗与全局注意力。这一章讲清楚这些变体各自改了什么、换来了什么、放弃了什么。</p>
+  </div>
+
+  <h3>变的是哪一层</h3>
+  <p>把 Transformer 块拆开，变体只动四个位置中的一两个，其余保持不变：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>位置</th><th>经典做法</th><th>变体</th></tr></thead>
+      <tbody>
+        <tr><td>注意力</td><td>多头全注意力（MHA）</td><td>MQA / GQA / MLA / 滑窗 / 线性注意力 / SSM</td></tr>
+        <tr><td>前馈网络</td><td>每个 token 过同一个 FFN</td><td>MoE：按路由激活少数专家</td></tr>
+        <tr><td>残差与归一化</td><td>Pre-LN + LayerNorm</td><td>RMSNorm、QK-norm、去掉 bias、z-loss</td></tr>
+        <tr><td>输出与训练目标</td><td>预测下一个 token</td><td>MTP：一次预测多个 token</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>记住这张表有用：看到一个"新架构"时，先问它改的是哪一行，再问代价落在哪（显存、通信、精度，还是训练难度）。</p>
+
+  <h3>MoE：用同样的显存换更多参数</h3>
+  <p>稠密模型的问题是参数与计算绑死：想让模型更聪明就加参数，但每加一个参数，每个 token 都要多算一次。混合专家（MoE）把 FFN 拆成 \(N\) 个专家，每个 token 只走其中 \(k\) 个：</p>
+
+  <div class="equation">
+    \[ y = \sum_{i \in \operatorname{TopK}(x)} g_i \, E_i(x), \qquad g = \operatorname{softmax}\big(\operatorname{TopK}(x W_g)\big) \]
+    <span class="eqno">16.1</span>
+  </div>
+
+  <p>参数量按"全部专家"算，计算量按"激活的专家"算。DeepSeek-V3 是 671B 总参数、每次激活 37B；Mixtral 8×7B 是 46.7B 总参数、激活 12.9B。这就是"用同样的算力换更大的容量"的含义。</p>
+
+  <p>代价有三个。第一，<b>显存不省</b>：671B 的权重仍然要放进显存，只是每次只读其中一部分，所以省的是带宽和计算，不是容量。第二，<b>路由会失衡</b>：如果所有 token 都挤向同一个专家，那个专家就成了瓶颈，其余专家白占显存。训练时加一个辅助损失把负载拉平：</p>
+
+  <div class="equation">
+    \[ \mathcal{L}_{\text{aux}} = \alpha \cdot N \sum_{i=1}^{N} f_i \, P_i \]
+    <span class="eqno">16.2</span>
+  </div>
+
+  <p>其中 \(f_i\) 是分到专家 \(i\) 的 token 比例，\(P_i\) 是路由给它的平均概率。两者相乘再求和，最均衡时取最小值。第三，<b>通信变重</b>：专家分布在多张卡上时，每个 token 要 all-to-all 发到它选中的专家所在的卡，再把结果发回来——这也是 MoE 推理必须用专家并行（EP）的原因。</p>
+
+  <div class="calc">
+    <div class="calc-title">DeepSeek-V3 的一次 decode：算力按激活参数算</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">前向 FLOPs</div><div class="calc-val">2 × 37B ≈ 74 GFLOPs/token（不是 2 × 671B）</div></div>
+      <div class="calc-row"><div class="calc-label">权重读取</div><div class="calc-val">只读激活的专家；但每层路由结果不同，实际读的是"这一层被选中的那几个专家"</div></div>
+      <div class="calc-row"><div class="calc-label">显存占用</div><div class="calc-val">671B × 1 字节（fp8）≈ 671 GB，单卡放不下，至少 8 卡</div></div>
+      <div class="calc-row"><div class="calc-label">通信</div><div class="calc-val">每层两次 all-to-all；EP 越大，通信占比越高</div></div>
+    </div>
+  </div>
+
+  <p>MoE 的 batch 越大越划算：一个 token 只激活 37B，但一次前向里不同 token 会选不同专家，合起来能把大部分专家都用上。反过来，batch 很小时只有少数专家被激活，显存里的其余专家就闲置了——这是 MoE 在低并发场景下性价比不如稠密模型的原因。</p>
+
+  <h3>MLA：把 KV 压成低维隐向量</h3>
+  <p>第 11 章算过 KV cache 的公式 \(C = 2\,L\,H_{kv}\,d\,T\,b\)。GQA 靠减少 \(H_{kv}\) 来省，MLA 换了个思路：<b>不存每头的 K 和 V，只存一份低维的隐向量</b>，需要时再用投影矩阵还原出各头的 K/V。</p>
+
+  <p>DeepSeek-V3 的做法是：每个 token 每层只缓存一个 512 维的压缩向量加 64 维的位置部分，注意力计算时再通过上投影得到 128 个头的 K 和 V：</p>
+
+  <div class="equation">
+    \[ C_{\text{MLA}} = L\,(d_c + d_r)\,T\,b, \qquad d_c = 512,\; d_r = 64 \]
+    <span class="eqno">16.3</span>
+  </div>
+
+  <p>代入 61 层、2 字节：\(61 \times 576 \times 2 = 70{,}272\) 字节 ≈ 70 KB/token。如果同样的模型用 128 头的 MHA，每 token 每层是 \(2 \times 128 \times 128 \times 2 = 65{,}536\) 字节，61 层合计约 4 MB/token——MLA 把它压到了 1/57。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>方案</th><th>每 token 的 KV（同规模）</th><th>相对 MHA</th><th>代价</th></tr></thead>
+      <tbody>
+        <tr><td>MHA</td><td>约 4 MB</td><td>1×</td><td>无</td></tr>
+        <tr><td>MQA</td><td>约 128 KB</td><td>1/32</td><td>所有头共用 K/V，表达力下降</td></tr>
+        <tr><td>GQA（8 组）</td><td>约 1 MB</td><td>1/4</td><td>折中方案，最常见</td></tr>
+        <tr><td>MLA</td><td>约 70 KB</td><td>1/57</td><td>需要模型结构支持；解码时要多一次上投影</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>代价是多了一次矩阵乘（把隐向量还原成 K/V），而且这个还原要在注意力 kernel 内部完成，实现难度比 GQA 高不少。收益则直接体现在并发数上：同样一张 80 GB 卡，MLA 能挂的 128K 上下文请求是 MHA 的几十倍。</p>
+
+  <h3>注意力变体地图</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>变体</th><th>核心改动</th><th>换来什么</th><th>放弃什么</th></tr></thead>
+      <tbody>
+        <tr><td>MQA</td><td>所有头共享一份 K/V</td><td>KV 省 1/H</td><td>表达力下降，长文本精度损失明显</td></tr>
+        <tr><td>GQA</td><td>头分成 G 组，组内共享</td><td>KV 省 H/G，精度接近 MHA</td><td>几乎无；现代模型的默认</td></tr>
+        <tr><td>MLA</td><td>KV 存成低秩隐向量</td><td>KV 省到 1/57</td><td>实现复杂、多一次投影</td></tr>
+        <tr><td>滑窗</td><td>只看最近 w 个位置</td><td>注意力计算降到 1/(T/w)</td><td>窗口外信息看不见</td></tr>
+        <tr><td>线性 / SSM</td><td>不存历史，迭代一个固定状态</td><td>decode 与 T 无关、显存不涨</td><td>精确检索能力弱</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>这张表里没有"更好"的选项，只有"在什么场景下更合适"。长文档问答要精确检索，全注意力 + GQA/MLA 是主流；超长流式输入（日志、传感器）看中固定开销，线性层或滑窗更合适；而绝大多数线上服务是 8K–32K 的短上下文，GQA 就已经足够。</p>
+
+  <h3>Mamba 与混合模型：把"记忆"换成状态</h3>
+  <p>状态空间模型（SSM，代表是 Mamba）把序列建模写成一个递推：每一步用当前输入更新一个固定大小的状态，输出由状态决定：</p>
+
+  <div class="equation">
+    \[ h_t = A\,h_{t-1} + B\,x_t, \qquad y_t = C\,h_t \]
+    <span class="eqno">16.4</span>
+  </div>
+
+  <p>状态 \(h\) 的大小与序列长度无关，于是 decode 的每步开销恒定、显存不随 T 增长——这是它相对 Transformer 最大的优势。代价也很直接：状态容量有限，"三个月前提到的那个人名"这类需要精确检索的信息容易丢。所以现在的做法是混合：大部分层用 SSM，少数层保留全注意力，兼顾吞吐与精度。</p>
+
+  <h3>MTP：一次预测多个 token</h3>
+  <p>标准训练目标是"给定前文，预测下一个 token"。多 token 预测（MTP）在同一次前向里额外预测后面几个位置，训练时信号更密集，推理时这些额外输出还可以当作投机解码的草稿——第 14 章的草稿来源表里就有这一项。</p>
+
+  <div class="equation">
+    \[ \mathcal{L}_{\text{MTP}} = \sum_{k=1}^{D} \lambda_k \, \mathcal{L}\big(p_\theta(x_{t+k} \mid x_{\le t})\big) \]
+    <span class="eqno">16.5</span>
+  </div>
+
+  <p>DeepSeek-V3 用 1 个额外的预测深度换到了约 1.8 倍的 decode 加速（草稿接受率不错），同时主任务的损失也更稳。代价是训练时多一份头与计算，且各深度的权重需要调。</p>
+
+  <h3>归一化与激活：小改动，大影响</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>组件</th><th>早期</th><th>现在常见</th><th>为什么改</th></tr></thead>
+      <tbody>
+        <tr><td>归一化</td><td>Post-LN + LayerNorm</td><td>Pre-LN + RMSNorm</td><td>Pre-LN 梯度更稳；RMSNorm 少一次减均值，快且够用</td></tr>
+        <tr><td>激活</td><td>ReLU → GELU</td><td>SwiGLU</td><td>门控结构在同参数下效果更好（FFN 维度要相应缩小）</td></tr>
+        <tr><td>注意力稳定</td><td>无</td><td>QK-norm、z-loss、去 bias</td><td>长训练时防止 logits 爆炸与 loss spike</td></tr>
+        <tr><td>位置编码</td><td>可学习绝对位置</td><td>RoPE（底数随长度调大）</td><td>相对位置、可外推、不增加参数</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>哪些没有变</h3>
+  <p>看完这些变体，容易误以为 Transformer 被换掉了。实际上四条主干一直没变：</p>
+  <ul>
+    <li><b>自回归的语言建模目标</b>：给定前文预测下一个 token，损失是交叉熵。</li>
+    <li><b>decoder-only 的堆叠结构</b>：残差 + 归一化 + 注意力 + FFN，重复 L 层。</li>
+    <li><b>KV cache 的账</b>：只要还有注意力，就还有"每 token 存 K/V、decode 每步读一遍"的成本结构；MLA 只是把这个常数改小。</li>
+    <li><b>GEMM 主导</b>：无论是注意力的 \(QK^{\top}\)、\(AV\)，还是 FFN 的两个矩阵乘，绝大部分 FLOPs 仍然落在矩阵乘法上——这也是量化、Tensor Core、CUDA graph 这些优化能通用的原因。</li>
+  </ul>
+
+  <div class="keyidea">
+    <b>这一章的要点</b>
+    <p>MoE 换的是"参数容量与计算量的绑定"，代价是显存与通信；MLA 换的是 KV 的存储形式，代价是一次额外的投影；滑窗与 SSM 换的是"记忆的容量与精度"，代价是精确检索能力；MTP 换的是训练的监督密度与推理的并行度。四条主干（自回归目标、decoder-only 堆叠、KV 账、GEMM 主导）没有变，所以前面十几章的分析依然成立。</p>
+  </div>
+
+  <div class="note">
+    <b>下一章</b>
+    <p>到第 16 章为止，"模型怎么算"这条线讲完了。但权重是怎么从数据里长出来的？第 17 章回到训练：预训练、缩放定律、SFT、RLHF/DPO/GRPO，以及每一步在优化什么目标。</p>
+  </div>
+</section>

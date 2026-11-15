@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>大模型是怎么想出一个字的 · 从零理解 LLM 的原理与推理全过程</title>
+<meta name="description" content="从零开始的深度学习式大模型教程：分词、嵌入、注意力、Transformer、训练、对齐、推理引擎与推理模型，全部用真实训练的小模型逐层算给你看。">
+<style>{{CSS}}</style>
+</head>
+<body>
+
+<div id="progress"></div>
+
+<header class="topbar">
+  <button class="icon-btn menu-btn" id="menu-btn" aria-label="打开目录">☰</button>
+  <div class="brand"><b>大模型是怎么想出一个字的</b><span>LLM · from scratch</span></div>
+  <div class="spacer"></div>
+  <div class="progress-num" id="progress-num">0%</div>
+  <button class="icon-btn" id="theme-btn" aria-label="切换深色/浅色">◐</button>
+</header>
+
+<aside class="sidebar" id="sidebar">
+  <div class="nav-label">目录 · Contents</div>
+  <ul class="toc" id="toc">
+{{NAV}}
+  </ul>
+  <div class="foot">
+    <p>单文件离线页面，公式为构建期预渲染的 KaTeX，交互演示由原生 JS 驱动。</p>
+    <p>页面里的所有数字都来自 <code>tools/toy_gpt.py</code> 真实训练的小模型：2 层、宽 8、参数量 1608。</p>
+  </div>
+</aside>
+
+<main>
+  <div class="wrap">
+{{BODY}}
+    <footer class="page-foot">
+      <p><b>关于这份材料</b>：写给"想把大模型彻底搞明白"的人。它不假设你有机器学习基础，但也不回避矩阵、梯度和张量形状——因为绕开这些东西，最后只会剩下比喻。</p>
+      <p>模型权重、注意力矩阵与 logits 由本地脚本训练并导出；公式由 KaTeX 在构建时渲染为静态 HTML；页面不加载任何外部资源，断网可用。</p>
+    </footer>
+  </div>
+</main>
+
+<script type="application/json" id="page-data">{{DATA}}</script>
+<script>{{JS}}</script>
+</body>
+</html>

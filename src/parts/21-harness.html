@@ -1,0 +1,222 @@
+<section class="chapter" id="ch21" data-num="21" data-title="Harness：模型外面那一圈代码" data-desc="主循环、工具运行时、权限与沙箱、压缩策略、子代理、事件流与评测">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第二十一章 · Harness 工程</div>
+    <h2>Harness：模型外面那一圈代码</h2>
+    <p class="lead">第 20 章讲的是 agent 的原理，这一章讲怎么把它做成能长期运行的东西。模型能力决定上限，外面这层代码决定你能否稳定地接近这个上限：同一个模型，harness 写得粗糙，任务成功率可能从 60% 掉到 20%，成本翻三倍，也可能在某次操作里误删你的文件。</p>
+  </div>
+
+  <h3>harness 由哪些部分组成</h3>
+  <p>harness 指的是模型之外、业务之内的全部代码。按"哪里会出问题"来分，大致是下面几块：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>部件</th><th>职责</th><th>坏了会怎样</th></tr></thead>
+      <tbody>
+        <tr><td><b>会话与事件流</b></td><td>记录每一轮的消息、工具调用、结果与状态</td><td>排障时无迹可查，无法回放</td></tr>
+        <tr><td><b>主循环</b></td><td>调模型 → 解析动作 → 执行 → 回填 → 判停</td><td>死循环、预算失控、提前收工</td></tr>
+        <tr><td><b>工具运行时</b></td><td>参数校验、执行、截断、错误包装</td><td>模型拿到无法修复的错误信息</td></tr>
+        <tr><td><b>执行环境</b></td><td>沙箱、文件系统、shell、网络边界</td><td>越权、误删、数据外泄</td></tr>
+        <tr><td><b>模型网关</b></td><td>选模型、重试、限流、缓存、记账</td><td>延迟抖动、成本不可控</td></tr>
+        <tr><td><b>观测与评测</b></td><td>指标、轨迹、回归任务集</td><td>改一处坏另一处，且无人知晓</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>主循环</h3>
+  <p>删掉所有花哨的部分，主循环二十行就能写完：</p>
+
+  <pre class="code"><code>def run(task, tools, budget):
+    messages = [system_prompt(tools), user(task)]
+    for step in range(budget.max_steps):
+        if budget.exceeded(messages):        # 上下文或花费超限
+            messages = compact(messages)      # 先压，再继续
+        reply = model.chat(messages, tools=tools.schema())
+
+        if not reply.tool_calls:              # 模型说完了
+            return finish(reply.text)
+
+        for call in reply.tool_calls:         # 可能并行多个
+            if not permitted(call):           # 权限门
+                messages.append(tool_error(call, "需要审批"))
+                continue
+            out = tools.run(call)             # 执行 + 截断 + 错误包装
+            messages.append(tool_result(call.id, out))
+    return abort("超过步数预算")</code></pre>
+
+  <p>这二十行里有四处必须做对，每一处做错都能单独毁掉体验：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>决定</th><th>怎么做</th><th>做错的后果</th></tr></thead>
+      <tbody>
+        <tr><td>什么时候停</td><td>模型不再调工具；或达到步数/花费/时间上限</td><td>无限循环烧钱，或改一半就交差</td></tr>
+        <tr><td>什么时候压</td><td>窗口用量到 70%–85%，或下一步输入预计超额</td><td>工具结果被挤爆，报一个看不懂的错</td></tr>
+        <tr><td>错误怎么回</td><td>结构化错误 + 修复线索 + 是否可重试</td><td>模型重复同一个错误动作到死</td></tr>
+        <tr><td>并行怎么处理</td><td>同一批 tool_call 并发执行，结果按 id 回填</td><td>串行执行把延迟放大 3–5 倍</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>工具怎么设计</h3>
+  <ol>
+    <li><b>少而正交。</b>十个边界清晰的工具，胜过四十个互相重叠的。工具一多，模型选错的概率就上去了，schema 本身也吃上下文。</li>
+    <li><b>幂等。</b>"读文件"随便调一百次都安全；"发邮件"必须要求显式确认。副作用的工具要能被识别出来。</li>
+    <li><b>返回值有上限。</b>任何工具都必须有截断策略（行数、字节数、结果条数），并在截断处明确标注"还有多少没显示"。</li>
+    <li><b>错误要可修复。</b>"invalid input" 是无用信息；"path 必须是相对路径，你传了绝对路径 /etc/passwd" 才能让模型下一轮改对。</li>
+    <li><b>结构化。</b>稳定的字段（status / stdout / stderr / exit_code）比一段自由文本好解析，也好压缩。</li>
+    <li><b>可组合。</b>让"搜索—读取—编辑—验证"能自然串成一条链，模型就会自己发明出工作流。</li>
+    <li><b>危险动作显式化。</b>删除、覆盖、提交、推送、花钱——这些必须是独立工具，而不是藏在某个参数里的隐式行为。</li>
+  </ol>
+
+  <h3>权限与沙箱</h3>
+  <p>agent 会执行模型写出来的命令，等于把 shell 交给一个概率模型。稳妥的做法是按危害分级，而不是去判断哪条命令"恶意"。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>档位</th><th>允许什么</th><th>典型场景</th><th>兜底</th></tr></thead>
+      <tbody>
+        <tr><td><b>只读</b></td><td>读文件、搜索、跑无副作用的查询</td><td>代码问答、代码审查</td><td>文件系统只读挂载</td></tr>
+        <tr><td><b>工作区可写</b></td><td>在工作目录内改文件、跑构建与测试</td><td>日常编码任务</td><td>目录级沙箱 + 网络受限</td></tr>
+        <tr><td><b>完全访问</b></td><td>任意路径、任意命令、联网</td><td>部署、环境修复</td><td>人工审批 + 审计日志 + 可回滚</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>还有三条细节值得单独说：</p>
+
+  <ul>
+    <li><b>审批要做得足够具体。</b>弹窗里要写清将要执行的确切命令和影响范围，能记住"这类操作本次会话内都同意"，也要能一键拒绝并让模型换条路走。</li>
+    <li><b>外部内容一律当数据。</b>网页、issue、依赖包里的 README 都可能写着"忽略之前的指令"。harness 必须把这些内容标记为不可信输入，且不让它触发工具调用链——这就是 prompt injection 的第一道防线。</li>
+    <li><b>凭据不进上下文。</b>环境变量、token 由 harness 在执行时注入，永远不要拼进 prompt。否则一次日志回吐就是一次泄露。</li>
+  </ul>
+
+  <h3>上下文管理：压缩什么</h3>
+  <p>第 20 章说上下文是瓶颈。harness 里应对它的手段是压缩（compaction）：到了阈值，用模型把早先的对话摘要成一段，替换掉原始消息。做得好与差，差别全在保留什么。</p>
+
+  <div class="compare">
+    <div>
+      <h4>必须保留</h4>
+      <ul>
+        <li>用户的原始目标与硬约束（"不要改公共 API"）</li>
+        <li>已经做出的决定与理由</li>
+        <li>当前进行到哪一步、还剩什么（TODO）</li>
+        <li>关键文件路径与行号</li>
+        <li>失败过的尝试（避免重蹈覆辙）</li>
+      </ul>
+    </div>
+    <div>
+      <h4>可以丢</h4>
+      <ul>
+        <li>已经执行过的工具的原始输出</li>
+        <li>重复读过的文件内容</li>
+        <li>中间过程的推理草稿</li>
+        <li>报错日志的全文（留错误类型与首行）</li>
+        <li>寒暄、确认、无关的搜索结果</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="keyidea">
+    <b>压缩要解决的问题</b>
+    <p>压缩的目的不是少花 token，而是把已经消耗掉的输出从之后每一步的上下文里删掉。所以宁可让模型多跑几步、多调一次工具，也不要把大块输出留在上下文里。</p>
+  </div>
+
+  <h3>子系统按需加载</h3>
+  <p>真实 harness 往往带几十个扩展：特定领域的技能、插件、MCP 连接的外部工具。全部写进系统提示，光 schema 就吃掉几万 token——而且 90% 的任务根本用不到。</p>
+
+  <p>通行的做法是先给索引：系统提示里只写"有哪些能力、什么条件下用"的一行说明，通常几十个 token；真正用到时，再由 harness 把完整说明注入上下文。插件、hook、MCP 工具的完整 schema 也一样，第一次调用时才加载。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>机制</th><th>典型作用</th><th>加载时机</th></tr></thead>
+      <tbody>
+        <tr><td>Skill / 技能包</td><td>某个领域的操作手册与脚本</td><td>任务命中领域时按需注入</td></tr>
+        <tr><td>MCP / 外部工具</td><td>把第三方能力接成工具</td><td>首次需要时握手、拉 schema</td></tr>
+        <tr><td>Hook / 生命周期钩子</td><td>在工具调用前后做校验、记账、通知</td><td>常驻，但要轻</td></tr>
+        <tr><td>子代理</td><td>把探索性工作隔离到独立上下文里跑</td><td>任务可拆分时派发</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>子代理与并行</h3>
+  <p>子代理最大的价值是上下文隔离，而不是并行加速：一个子代理读了四十个文件、试了五种方案，最后只把一段结论交回父代理。父上下文里多了一条消息，而不是几万 token 的探索过程。</p>
+
+  <div class="calc">
+    <div class="calc-title">一次"搜索 + 试错"的隔离效果</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">子代理内部消耗</div><div class="calc-val">约 12 步、平均 15K 输入 ≈ 18 万 token 的读入</div></div>
+      <div class="calc-row"><div class="calc-label">回传父代理</div><div class="calc-val">一段 400 token 的结论 + 两个文件路径</div></div>
+      <div class="calc-row"><div class="calc-label">对父上下文的增长</div><div class="calc-val">≈ 0.4K，而不是 12 步 × 15K</div></div>
+      <div class="calc-row"><div class="calc-label">代价</div><div class="calc-val">子代理看不到父代理的全部上下文，需要把必要前提写进任务描述</div></div>
+    </div>
+  </div>
+
+  <p>并行的边界也要划清：读操作可以随便并行；写操作并行就会冲突（两个子代理改同一个文件）。常见折中是"并行探索、串行修改"，或者按文件/目录切分所有权。</p>
+
+  <h3>事件流与回放</h3>
+  <p>agent 出问题时，最有用的不是"再跑一遍看看"，而是一份完整的轨迹：第几步、输入多长、调了什么工具、参数是什么、返回了什么、花了多久、多少钱。这就是事件流（session events）的价值。</p>
+
+  <ul>
+    <li><b>可回放</b>：把轨迹重放，能在不打模型的情况下复现解析、权限、截断逻辑的 bug。</li>
+    <li><b>可审计</b>：谁在什么时候让 agent 改了什么，必须能查。这在团队环境里是硬需求。</li>
+    <li><b>可归因</b>：失败到底是模型选错工具、工具返回噪声、还是 harness 解析错？没有轨迹就只能猜。</li>
+  </ul>
+
+  <p class="note">一个实用的判据：如果一个 bug 你没法只靠轨迹看出来，说明观测还不够。</p>
+
+  <h3>harness 与推理层的接口</h3>
+  <p>harness 的设计直接决定推理层的前缀缓存能不能命中——这是两个团队最容易互相甩锅的地方。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>harness 的做法</th><th>对推理层的影响</th></tr></thead>
+      <tbody>
+        <tr><td>系统提示与工具 schema 固定、顺序稳定</td><td>前缀缓存稳定命中，输入成本降到约 1/10</td></tr>
+        <tr><td>每步动态改写系统提示（插入时间、随机 id）</td><td>前缀失效，每一轮都按全价重算</td></tr>
+        <tr><td>把大段工具结果整块塞进历史</td><td>每步输入变长，TTFT 与成本一起涨</td></tr>
+        <tr><td>一次并行发多个 tool_call</td><td>工具往返串行变并行，端到端延迟明显下降</td></tr>
+        <tr><td>压缩时重写整段历史</td><td>缓存全部失效一次，之后重新累积（可接受，但别频繁做）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>怎么评测 harness</h3>
+  <p>harness 的回归测试不能只测函数返回值，还要测整条轨迹的行为。够用的配置有三部分：</p>
+
+  <ol>
+    <li><b>golden tasks</b>：20–50 个真实任务，每个都有可自动判定的终态（跑测试、比对 diff、检查文件存在）。</li>
+    <li><b>轨迹断言</b>：除了终态，还要断言"必须跑过测试""不许修改断言文件""工具调用次数不超过 N"。</li>
+    <li><b>成本与延迟门槛</b>：每个任务记录 token 与耗时，超过基线 30% 就报警——性能退化往往先于质量退化出现。</li>
+  </ol>
+
+  <p>跑评测时最容易被忽略的一点：<b>模型换了、提示词改了、工具描述改了，都算线上变更</b>，都要过这套回归。很多"模型变笨了"的抱怨，最后追到的是某个工具的描述被顺手改短了。</p>
+
+  <h3>踩过的坑</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>经验</th><th>为什么</th></tr></thead>
+      <tbody>
+        <tr><td>先做停止条件，再做能力</td><td>没有停止条件的 agent 是烧钱机器</td></tr>
+        <tr><td>工具宁少勿多，描述宁长勿短</td><td>工具数量影响选择准确率，描述质量影响参数正确率</td></tr>
+        <tr><td>所有工具输出都要截断</td><td>一条没截断的日志能毁掉整次任务</td></tr>
+        <tr><td>错误信息写给模型看，不是给人看</td><td>模型是下一个读者，它需要的是"怎么改"</td></tr>
+        <tr><td>状态写文件，别写记忆里</td><td>上下文会丢，文件不会</td></tr>
+        <tr><td>危险操作单独建工具</td><td>才能拦、才能审、才能回滚</td></tr>
+        <tr><td>外部内容默认不可信</td><td>prompt injection 的第一道防线</td></tr>
+        <tr><td>每次变更都跑 golden tasks</td><td>提示词与工具的改动比模型升级更常见</td></tr>
+        <tr><td>先修观测，再修 bug</td><td>没有轨迹的修复都是猜</td></tr>
+        <tr><td>成本是一个功能指标</td><td>成功率相同、成本五倍，就是两个产品</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="keyidea">
+    <b>小结</b>
+    <p>harness 就是模型之外那圈代码：会话、主循环、工具运行时、执行环境、模型网关、观测评测，每一块都有各自的坏法。主循环里只有四处需要判断——什么时候停、什么时候压缩、错误怎么回、并行怎么处理。安全靠分级而不是靠识别：只读、工作区可写、完全访问，危险动作单独做成工具，外部内容一律当数据。压缩的意义在于把已消耗的输出从之后每一步的账单里删掉；前缀是否稳定决定成本能省下多少；没有轨迹和 golden tasks，调 harness 就只是在凭感觉猜。</p>
+  </div>
+
+  <div class="note">
+    <b>下一章</b>
+    <p>到这里，从一次前向到一个能动手的系统，整条链路都走过了。最后一章把尺度拉远：这些模型和系统在真实世界里有多大、要花多少钱、以及十个流传很广但其实错的说法。</p>
+  </div>
+</section>

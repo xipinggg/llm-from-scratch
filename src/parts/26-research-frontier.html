@@ -1,0 +1,162 @@
+<section class="chapter" id="ch26" data-num="26" data-title="研究前沿：推理引擎正在往哪走" data-desc="2025–2026 年这条线的八条主线：PD 分离与 KV 传输、KV 作为一等存储、架构与系统协同、投机与 MTP、MoE 大规模并行、kernel 与编译、长上下文与 agent 负载、调度与公平；附研究地图、八个可验证空白与读论文的五问">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第二十六章 · 前瞻</div>
+    <h2>研究前沿：推理引擎正在往哪走</h2>
+    <p class="lead">前面的章节讲的都是"已经定型的机制"。这一章换一个角度：2025–2026 年，做推理系统的人正在解决什么问题、用什么办法、拿到了多大的数字、还剩什么没解决。它更像一张地图而不是教程——读完之后，你应该能判断一篇新论文在打哪一场仗，也能看出哪些"优化"其实是在把瓶颈换个地方。</p>
+  </div>
+
+  <h3>为什么重心从 kernel 移到了数据移动</h3>
+  <p>2022–2024 年，推理性能的提升主要来自把单个算子写快：FlashAttention 把注意力的访存从平方降到线性、PagedAttention 把显存碎片压掉、连续批处理把 GPU 的空闲填满。这些优化现在已经被吃到极限——主流的三个生产引擎（vLLM、SGLang、TensorRT-LLM）在这些点上的差距通常只剩个位数百分比。</p>
+  <p>而 roofline 那笔账没有变：一次 decode 要把 16 GB 权重从显存读一遍，算力只用掉 2%–3%。<b>把 kernel 写快解决不了"读得多"</b>。于是 2025 年之后的研究集中在四个动作上：</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>动作</th><th>典型手段</th><th>收益量级</th><th>成熟度</th></tr></thead>
+      <tbody>
+        <tr><td>搬得少</td><td>KV 量化、稀疏注意力、GQA/MLA、线性注意力</td><td>2–50×</td><td>已进模型结构</td></tr>
+        <tr><td>搬得快</td><td>NVLink、RDMA、分层存储、异步拷贝</td><td>4–30×</td><td>已产品化</td></tr>
+        <tr><td>搬得巧</td><td>PD 分离、前缀缓存、跨实例共享、按会话调度</td><td>1.5–6×</td><td>产品化中</td></tr>
+        <tr><td>少搬一次</td><td>投机解码、MTP、批内复用</td><td>1.5–3×</td><td>已进默认配置</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>这张表也是下面八条主线的索引：每一条都在打其中一行。</p>
+
+  <h3>主线一：PD 分离，从"拆开"到"按 SLO 自动配比"</h3>
+  <p>预填充吃算力、解码吃带宽，放在同一张卡上必然有一半资源闲着。2024 年的 DistServe、Splitwise 证明了"拆开"有效，2025 年之后的问题变成了三件：拆开之后比例怎么定、KV 怎么搬、异构硬件上怎么搬。</p>
+  <ul>
+    <li><b>Mooncake</b>（FAST'25 最佳论文）把整台服务改造成以 KVCache 为中心：prefill 集群与 decode 集群分离，同时把推理集群里闲置的 CPU、DRAM、SSD、NIC 组成一个独立的 KV 缓存池，再由全局缓存与调度器在 SLO 约束下最大化吞吐。真实流量下有效请求处理能力提升 <b>59%–498%</b>，已在数千节点上每天处理 <b>1000 亿 token</b>。<a href="https://www.tsinghua.edu.cn/en/info/1245/14138.htm" target="_blank" rel="noopener">来源</a></li>
+    <li><b>Dynamo 与 llm-d</b> 把这件事产品化：Planner Profiler 先测出本机型的性能曲线，SLA Planner 再按目标 SLO 自动匹配 prefill:decode 的实例比例；KV 通过 NIXL 在 RDMA 上搬；多模态进一步拆成 <b>EPD</b>（encode–prefill–decode）三段。<a href="https://www.nvidia.com/en-us/on-demand/session/other25-dynamoday14/" target="_blank" rel="noopener">Dynamo 会议</a>、<a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/a509402c0b5455d11ddc2b5fa83cc8c0d2e0692b/phases/17-infrastructure-and-production/17-disaggregated-prefill-decode/docs/en.md" target="_blank" rel="noopener">机制说明</a></li>
+    <li><b>异构 PD</b> 是 2026 年的新方向：AsymFlow 让 CPU 承担预填充/解码分离后的部分工作，其 CPU 侧 decode 注意力算子快 <b>2 倍</b>（<a href="https://dl.acm.org/doi/10.1145/3832810.3832866" target="_blank" rel="noopener">ICPP'26</a>）；PiKV-Serve 面向边缘-云链路，把 KV 按层流水线迁移、与计算重叠（<a href="https://ieeexplore.ieee.org/document/11746543" target="_blank" rel="noopener">IEEE</a>）。</li>
+  </ul>
+  <p><b>还没解决</b>：KV 传输的尾延迟（一次 1.28 GB 的跨节点搬运就是几十毫秒，见第 11 章的分层表）、prefill:decode 比例对负载突变不鲁棒、跨数据中心基本不可行。</p>
+
+  <h3>主线二：KV cache 从"副产品"变成"一等存储"</h3>
+  <p>这是过去两年变化最大的一条。核心认识是：KV 是可以被<b>寻址、复用、分层、跨实例共享</b>的对象，而不是某个请求的私有中间变量。</p>
+  <ul>
+    <li><b>LMCache</b> 把卸载做成独立服务：在 Dynamo 里以 DaemonSet 跑，通过跨 Pod CUDA IPC 与 worker 共享张量（<a href="https://docs.dynamo.nvidia.com/dynamo/v1.6.1/kubernetes/kv-cache-offloading/deploy-lm-cache-mp" target="_blank" rel="noopener">文档</a>）；2026 年又做了<b>多节点 P2P CPU 内存共享</b>，专门解决"多实例各攒各的缓存"——四个实例时缓存命中率会掉到 1/4（<a href="https://blog.lmcache.ai/en/2026/01/21/p2p-1/" target="_blank" rel="noopener">博客</a>）。</li>
+    <li><b>全局 KV 感知调度</b>：Axon（SIGOPS ATC'26）把"上下文在哪台机器上"变成调度变量——会话级的上下文可以在 GPU 常驻缓存与 CPU 内存之间迁移，优先走 PCIe 恢复、必要时才做 GPU-GPU 迁移，已实现在 vLLM 之上，用生产 agent 轨迹在 4 台 A100 上评测（<a href="https://dl.acm.org/doi/10.1145/3828523.3857095" target="_blank" rel="noopener">论文</a>）。</li>
+    <li><b>反向的声音</b>：vAttention 认为分页本身是性能负担——它用操作系统式虚拟内存加 CUDA VMM 做"按需映射的连续 KV"，并引用实测：paged prefill kernel 比非分页慢约 <b>42%</b>，部分场景整体延迟高约 <b>5%</b>（<a href="https://arxiv.org/html/2405.04437" target="_blank" rel="noopener">论文</a>）。这条线提醒：分页解决碎片，但把复杂度转嫁给了 kernel。</li>
+  </ul>
+  <p><b>还没解决</b>：缓存一致性（权重版本、LoRA、精度）、失效语义、跨租户的计时侧信道（第 11 章安全一节）、跨集群共享的可行性。</p>
+
+  <h3>主线三：架构与系统的协同设计</h3>
+  <p>模型结构正在<b>为了服务成本而改变</b>，这是 2025 年最值得注意的趋势。三例子：</p>
+  <ul>
+    <li><b>DSA（DeepSeek Sparse Attention）</b>：V3.2-Exp 用两级注意力——先由 lightning indexer 给全量缓存打分、每层保留 top-2048，再对这 2048 个 token 做稀疏注意力（<a href="https://www.amd.com/en/developer/resources/technical-articles/2025/amd-instinct-mi335x-gpu-supports-deepseek-v3-2-exp.html" target="_blank" rel="noopener">技术说明</a>）。</li>
+    <li><b>瓶颈搬家</b>：长上下文下 decode 的时间花在"每层扫一遍全量缓存"的索引器上，注意力每层都要等它。NeurIPS'26 的多层索引器论文进一步指出：相邻层选出的 token 高度重叠，因此索引器可以跨层共享（<a href="https://neurips.cc/virtual/2026/loc/atlanta/173747" target="_blank" rel="noopener">论文</a>）。</li>
+    <li><b>线性与混合注意力</b>（Qwen3-Next 的 Gated DeltaNet 层、Mamba/RWKV 类状态递推）：KV 不再随长度增长，但 decode 每步要读写固定大小的状态矩阵。按 3 层 GDN + 1 层全注意力的配置估算，GDN 的 decode 算术强度只有约 <b>0.87 FLOP/B</b>——瓶颈从"读 KV"变成"读写状态"。</li>
+  </ul>
+  <p><b>还没解决</b>：稀疏索引器自身的高效 kernel、混合架构的缓存语义（循环状态与 KV 并存）、训练与推理在稀疏模式上的一致性。</p>
+
+  <h3>主线四：投机解码从论文走进默认配置</h3>
+  <ul>
+    <li><b>EAGLE-3</b> 不再训练独立草稿模型，而是在目标模型内部层挂一个只有 <b>2%–5%</b> 大小的草稿头，在特征级与词元级同时预测；Google Vertex AI 用 SGLang 大规模部署，解码提速约 <b>2–3 倍</b>（<a href="https://docs.cloud.google.com/vertex-ai/docs/blog/posts/from-research-to-production-accelerate-oss-llm-with-eagle-3-on-vertex" target="_blank" rel="noopener">博客</a>）。</li>
+    <li><b>MTP（多 token 预测）</b>从 DeepSeek-V3 起成为新模型的标配头，推理引擎把它当"内置投机"。</li>
+    <li>研究点转到了<b>交互项</b>：接受率随 batch 增大而衰减、被拒绝的草稿 token 不能写进 KV 缓存（否则下一次命中就错，见第 11 章前缀缓存一节）、与结构化输出/约束解码的先后顺序。</li>
+  </ul>
+
+  <h3>主线五：MoE 与大规模并行</h3>
+  <ul>
+    <li><b>wide EP</b>：DeepSeek 的 large-scale EP、DeepEP 通信库把专家并行推到几十卡；TensorRT-LLM 在 GB200 上做了 EP32 的实测，<b>在线 EPLB</b> 周期性重排专家放置，配合专家副本把最热的 rank 打散（<a href="https://nvidia.github.io/TensorRT-LLM/1.2.0rc5/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html" target="_blank" rel="noopener">技术博客</a>）。</li>
+    <li>研究点：all-to-all 与注意力的重叠、路由负载偏斜、专家副本的收益与显存代价、EP 规模上去之后的故障恢复（FailSafe、ReviveMoE 一类工作）。</li>
+  </ul>
+
+  <h3>主线六：kernel、编译与精度</h3>
+  <ul>
+    <li><b>FlashAttention-4</b> 是"算法与流水线协同设计"，针对 Blackwell 的非对称扩展（tcgen05、warp specialization、软硬件协同的 softmax 重缩放）。<a href="https://ar5iv.labs.arxiv.org/html/2603.05451" target="_blank" rel="noopener">论文</a>、<a href="https://pypi.org/project/fa4-jax/0.1.0/" target="_blank" rel="noopener">CuTe DSL 实现</a></li>
+    <li><b>手写 kernel 仍不可替代</b>：CuTe DSL 让"只针对某代 GPU 的高性能库"变得可行，比如只支持 SM120 的 NVFP4 GEMM / MoE / paged attention 库，直接对接 vLLM 与 SGLang（<a href="https://pypi.org/project/b12x/0.1.0/" target="_blank" rel="noopener">b12x</a>）。</li>
+    <li><b>编译与自动调优的代价被正式对待</b>：TensorRT-LLM 的一个改动显示，首次 prefill 要编译 42–59 个 Triton 变体、每 rank 约 <b>31 秒</b>；改成提前预编译后降到约 <b>5 秒</b>（<a href="https://github.com/NVIDIA/TensorRT-LLM/pull/19843" target="_blank" rel="noopener">PR</a>）。</li>
+    <li>研究点：JIT 冷启动、CUDA graph 与动态形状的冲突、FP8/FP4 的 scale 布局、注意力后端与批次形状的兼容性。</li>
+  </ul>
+
+  <h3>主线七：长上下文与 agent 负载</h3>
+  <ul>
+    <li><b>Decode Context Parallelism（DCP）</b>：decode 阶段把 KV 按序列切到多卡，用更多 GPU 换更长上下文与更大并发；vLLM 在 2026 年专门写了博客讲它在长上下文 agent 场景下的收益（<a href="https://vllm.ai/blog/2026-08-07-decode-context-parallelism" target="_blank" rel="noopener">博客</a>）。</li>
+    <li><b>负载形态变了</b>：长思维链让推理从"算力受限"转向"容量受限"——KV 随思考长度线性增长，系统刻画显示 8B 到 671B 的最优并行策略都因此改变（<a href="https://ieeexplore.ieee.org/document/11617776" target="_blank" rel="noopener">IEEE 2026</a>）；KV 剪枝开始针对推理负载做层与时间自适应（Lethe，<a href="https://ojs.aaai.org/index.php/AAAI/article/view/40036" target="_blank" rel="noopener">AAAI'26</a>）。</li>
+    <li><b>容量分层</b>：短上下文走低延迟实例、中长上下文走平衡配置、超长上下文走专用池（<a href="https://introl.com/blog/long-context-llm-infrastructure-million-token-windows-guide" target="_blank" rel="noopener">实践综述</a>）。</li>
+  </ul>
+
+  <h3>主线八：调度、公平与可运维性</h3>
+  <ul>
+    <li><b>体验公平</b>：AAAI'26 的 Experiential Fairness 指出，按资源分配的公平性与用户感知的流式体验并不一致，提出以"体验"为目标的调度（<a href="https://ojs.aaai.org/index.php/AAAI/article/view/40946/44907" target="_blank" rel="noopener">论文</a>）。</li>
+    <li><b>故障与恢复</b>：FailSafe 处理不规则 GPU 可用性下的张量并行；ReviveMoE 面向大规模 MoE 的快速恢复（概述见<a href="https://raw.githubusercontent.com/anthony-chaudhary/fak/refs/tags/v0.43.0/docs/industry-scorecard/operability.md" target="_blank" rel="noopener">这份运维对照</a>）。</li>
+    <li><b>容量规划用模拟器</b>：Vidur 只做一次 profiling，就能在 CPU 上模拟调度策略、投机解码与并行配置的端到端性能（<a href="https://pypi.org/project/vidur/0.0.17/" target="_blank" rel="noopener">工具</a>）。</li>
+  </ul>
+
+  <h3>一张研究地图</h3>
+  <div class="tablewrap tight">
+    <table>
+      <thead><tr><th>方向</th><th>核心问题</th><th>代表工作</th><th>量化收益</th><th>成熟度</th></tr></thead>
+      <tbody>
+        <tr><td>PD 分离</td><td>比例怎么定、KV 怎么搬</td><td>Mooncake、Dynamo、llm-d</td><td>有效容量 1.6–6×</td><td>生产</td></tr>
+        <tr><td>KV 存储层</td><td>缓存放哪、谁能用</td><td>LMCache、HiCache、Axon</td><td>命中率从 1/N 到接近 1</td><td>生产/试点</td></tr>
+        <tr><td>非分页内存</td><td>分页的 kernel 代价</td><td>vAttention</td><td>prefill +42%（反例）</td><td>研究</td></tr>
+        <tr><td>原生稀疏</td><td>选谁、谁选</td><td>DSA、NSA、多层索引器</td><td>长上下文成本显著下降</td><td>生产（V3.2/GLM-5）</td></tr>
+        <tr><td>线性/混合</td><td>状态的读写成本</td><td>Qwen3-Next、Mamba</td><td>KV 不随长度增长</td><td>生产</td></tr>
+        <tr><td>投机与 MTP</td><td>接受率、与缓存的一致性</td><td>EAGLE-3、MTP</td><td>解码 2–3×</td><td>生产</td></tr>
+        <tr><td>MoE 大 EP</td><td>通信与负载均衡</td><td>DeepEP、EPLB</td><td>热点 rank 被打散（在线 EPLB）</td><td>生产</td></tr>
+        <tr><td>kernel 与编译</td><td>异步硬件、冷启动</td><td>FA4、CuTe DSL、NVFP4</td><td>启动 31s→5s</td><td>生产/研究</td></tr>
+        <tr><td>长上下文/agent</td><td>容量与会话级 SLO</td><td>DCP、Lethe、Axon</td><td>并发提升（视链路与长度）</td><td>生产/试点</td></tr>
+        <tr><td>调度与公平</td><td>尾延迟、体验、恢复</td><td>Vidur、FailSafe、体验公平</td><td>取决于负载</td><td>研究</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>三个判断</h3>
+  <div class="compare">
+    <div>
+      <h4>一、重心从单个算子移到数据移动</h4>
+      <p>单算子优化的空间已经吃尽，剩下的大头是"KV 放在哪、谁来搬、什么时候搬、按什么规则分给谁"。这也是为什么过去两年最亮眼的结果多来自系统论文而不是 kernel 论文。</p>
+    </div>
+    <div>
+      <h4>二、模型与系统开始共同设计</h4>
+      <p>DSA、MTP、混合线性注意力都是"为了服务成本而改结构"；反过来，引擎也在为这些结构定制 kernel（稀疏索引器、状态缓存、MLA 吸收）。两边不再是上下游，而是同一个设计问题的两半。</p>
+    </div>
+  </div>
+  <div class="compare">
+    <div>
+      <h4>三、目标从吞吐变成延迟承诺、公平与成本</h4>
+      <p>多租户、agent 长会话、推理模型的长时间思考，都在迫使调度器处理"尾延迟、缓存命中率、单位会话成本"，而不是只盯 tokens/s。可承诺的延迟正在成为比峰值吞吐更重要的指标。</p>
+    </div>
+    <div>
+      <h4>反面提醒：没有免费的优化</h4>
+      <p>本页出现过三次"瓶颈搬家"：稀疏把瓶颈搬到索引器，线性注意力搬到状态读写，PD 分离把瓶颈搬到 KV 传输。看到一个优化，先问它把成本挪到了哪里、那个地方会不会成为新的墙。</p>
+    </div>
+  </div>
+
+  <h3>如果你要做研究：八个可验证的空白</h3>
+  <ol>
+    <li><b>多层索引器的选择一致性</b>：相邻层重叠多少才算"可以共享"？需要的是可度量的选择相似度，以及共享之后的精度损失上界。</li>
+    <li><b>混合架构的缓存语义</b>：GDN/Mamba 的循环状态与 KV 并存时，"前缀缓存"该怎么定义？状态的更新不是只追加，复用条件要重新推。</li>
+    <li><b>跨集群 KV 迁移的 SLO 可行性</b>：在 50 ms 量级的广域链路上，什么规模的请求值得搬、什么规模不如重算？目前只有单机房数据。</li>
+    <li><b>投机 + 前缀缓存 + 约束解码的三方交互</b>：三者对"哪些 token 合法"的判断顺序不同，组合起来的一致性还没有系统论证。</li>
+    <li><b>稀疏注意力的 prefill kernel</b>：现有稀疏优化大多针对 decode；prefill 阶段块稀疏在张量核心上的利用率仍是开放问题。</li>
+    <li><b>会话级容量规划</b>：agent 的 SLO 不是"每个请求多快"，而是"这个会话多久能推进完"，需要新的度量与调度目标。</li>
+    <li><b>联合基准</b>：长上下文 + agent + 投机的组合负载缺一个公认基准，现有 benchmark 各自只覆盖一角。</li>
+    <li><b>共享缓存的安全</b>：前缀缓存的计时侧信道已有攻击，但"可证明的防护 + 可接受的性能损失"还没有落地答案。</li>
+  </ol>
+
+  <h3>怎么读这些论文：五个问题</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>问题</th><th>为什么重要</th><th>看哪里</th></tr></thead>
+      <tbody>
+        <tr><td>baseline 是谁</td><td>打 vLLM 默认配置和打 TRT-LLM 调优配置，结论可能相反</td><td>实验设置那一节</td></tr>
+        <tr><td>度量是什么</td><td>TTFT、TPOT、goodput、$/百万 token 是四个不同的目标</td><td>指标定义与负载描述</td></tr>
+        <tr><td>负载从哪来</td><td>合成 trace 与真实 trace 的最优配置常常不同</td><td>workload 一节</td></tr>
+        <tr><td>隐藏成本是多少</td><td>编译时间、显存占用、迁移带宽、冷启动往往不进主表</td><td>结果表之外的脚注</td></tr>
+        <tr><td>能复现吗</td><td>代码/配置/trace 是否公开，决定结论能不能迁移到你的机器</td><td>artifact 与附录</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="keyidea">
+    <b>这一章的用法</b>
+    <p>把这张地图当目录：遇到新论文，先定位它打的是哪一行、把成本挪到了哪里；做选型时，先问自己的负载落在哪个区间（长上下文?agent?高并发短请求?），再挑对应主线的结论。本书前面所有章节给的数字都是"机制不变时的账"，这一章给的是"机制正在变的方向"——两者一起看，才不会把某一年的最优配置当成永恒答案。</p>
+  </div>
+
+  <div class="note">
+    <b>关于来源与时效</b>
+    <p>本章的数字都来自 2025–2026 年的公开论文、官方文档与工程博客，链接附在正文里（离线打开时链接不可点，但不影响阅读）。这个领域半年就会变一轮：看到具体倍数时，先确认它对应的模型规模、硬件与负载；看到"生产可用"时，先确认它指的是引擎默认配置还是某家公司的内部部署。</p>
+  </div>
+</section>

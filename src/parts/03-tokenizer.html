@@ -1,0 +1,90 @@
+<section class="chapter" id="ch03" data-num="03" data-title="分词：把文字变成整数" data-desc="BPE 如何切分世界，以及为什么它总被吐槽" data-desc-note="">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第三章 · 分词</div>
+    <h2>分词：把文字变成整数</h2>
+    <p class="lead">神经网络只认识数字。所以在一切开始之前，得先把字符串切成一串整数。"怎么切"这件小事，决定了模型数数会不会错、中文贵不贵、罕见词有没有救。</p>
+  </div>
+
+  <h3>最朴素的做法，以及它为什么不够</h3>
+  <p>我们这个玩具模型用的是最朴素的办法：<b>一个字符一个 token</b>。词表就是语料里出现过的 17 个字符：</p>
+
+  <div class="tablewrap tight">
+    <table>
+      <thead><tr><th>id</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th><th>13</th><th>14</th><th>15</th><th>16</th></tr></thead>
+      <tbody>
+        <tr><td>字符</td><td>␣</td><td>.</td><td>a</td><td>c</td><td>d</td><td>e</td><td>g</td><td>h</td><td>i</td><td>l</td><td>m</td><td>n</td><td>o</td><td>r</td><td>s</td><td>t</td><td>w</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>于是 <span class="tok">the cat sat on the m</span> 变成：</p>
+  <div class="calc">
+    <div class="calc-title">字符级编码</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">字符串</div><div class="calc-val">t h e ␣ c a t ␣ s a t ␣ o n ␣ t h e ␣ m</div></div>
+      <div class="calc-row"><div class="calc-label">ID 序列 <span class="shape">[20]</span></div><div class="calc-val"><span class="pos">15 7 5 0 3 2 15 0 14 2 15 0 12 11 0 15 7 5 0 10</span></div></div>
+    </div>
+  </div>
+
+  <p>字符级的优点是词表极小、永远不认识"未登录词"；缺点是<b>序列太长</b>。同样一句话，字符级要 20 个位置，词级只要 5 个（the / cat / sat / on / the）。而注意力的计算量随序列长度平方增长——20 个位置变 100 个位置，注意力开销就是 25 倍。所以真实模型几乎都选中间路线：<b>子词（subword）</b>。</p>
+
+  <h3>BPE：从字符开始，不断合并最频繁的邻居</h3>
+  <p>Byte Pair Encoding 的算法只有三步，循环执行：</p>
+  <ol class="steps">
+    <li><b>数</b>　扫描整个语料，统计所有相邻 token 对出现的次数。</li>
+    <li><b>并</b>　把出现次数最多的那一对，合并成一个新的 token，记进合并表。</li>
+    <li><b>停</b>　重复直到词表达到目标大小（比如 32000、100000、200000）。</li>
+  </ol>
+  <p>编码新文本时，按合并表<b>从早到晚</b>的顺序依次尝试合并（早合并的优先级高），得到的 token 序列就是模型的输入。</p>
+
+  <div class="demo" data-demo="bpe">
+    <div class="demo-head">
+      <span class="badge">交互</span>
+      <b>BPE 分词器</b>
+      <span class="hint">改文字看切分变化</span>
+    </div>
+    <div class="demo-body">
+      <textarea id="bpe-in" rows="2" spellcheck="false">大模型通过预测下一个词来学习</textarea>
+      <div class="bpe-out" id="bpe-out"></div>
+      <div class="bpe-stats" id="bpe-stats"></div>
+      <div class="calc-note">蓝色 token 表示它是由多个字符合并出来的。合并表用 238 条规则训练自约 2000 字的中文语料，只覆盖很窄的领域——所以罕见的字会停留在单字符。<b>真实分词器见过上万亿 token</b>，合并表大得多。</div>
+    </div>
+  </div>
+
+  <p>你可以在输入框里试试这些：<code>注意力机制</code>（应该会被切成几个词）、<code>大模型是一种用大量文本训练出来的神经网络</code>（训练语料里的句子，合并率最高）、以及一段英文或数字，观察它们怎么碎成单个字符。</p>
+
+  <h3>为什么分词器总被骂</h3>
+  <p>分词是很容易被忽略的一层，因为它把人类书写的边界抹掉了。几个真实后果：</p>
+
+  <div class="compare">
+    <div>
+      <h4>数字被切碎</h4>
+      <p>GPT 系列的分词器会把 <code>12345</code> 切成 <code>123</code> + <code>45</code> 之类的碎片，于是模型"看见"的不是一万二千三百四十五，而是两段数字符号。这是模型做算术容易出错的原因之一——它得先学会把碎片重新拼成数位。</p>
+    </div>
+    <div>
+      <h4>中文更贵</h4>
+      <p>同一个意思，中文的 token 数常常是英文的 1.5 到 2 倍（取决于分词器）。按 token 计费，中文用户实际付出的单价更高；上下文窗口也用得更快。这不是模型"不聪明"，是分词器在训练语料里见到的中文更少。</p>
+    </div>
+  </div>
+
+  <div class="compare">
+    <div>
+      <h4>"数草莓里有几个 r"</h4>
+      <p>如果 <code>strawberry</code> 是一个完整的 token，模型内部根本没有"r 出现了三次"这个信息——它看到的是一个符号，不是一个字母序列。要数清字母，模型得先把它拆开，或者靠推理绕路。</p>
+    </div>
+    <div>
+      <h4>空格也是 token</h4>
+      <p>注意上面的编码里，␣ 占了 4 个位置。GPT-2 的分词器把"空格 + 词"当成一个整体（Ġthe），所以句首的词和句中的词是不同的 token。这类细节会影响模型对格式的敏感度。</p>
+    </div>
+  </div>
+
+  <div class="keyidea">
+    <b>分词器在做什么</b>
+    <p>BPE 在做的，是用有限的词表去最大化文本的压缩率：常见组合用一个 token 表示（省位置），罕见组合退化成字符（保证永远能表示）。词表大小是一个权衡——太大，嵌入矩阵和输出层的参数暴涨；太小，序列变长、注意力变贵。15 万词表是当下大模型的常见折中。</p>
+  </div>
+
+  <div class="note">
+    <b>本页后面都用字符级</b>
+    <p>为了让每个数字都能手算，我们的玩具模型停在字符级。这带来一个有趣的现象：模型必须自己学会"t-h-e 连在一起是一个词"——没有分词器帮它。第 5 章你会看到注意力是怎么自己长出这个能力的。</p>
+  </div>
+</section>

@@ -1,0 +1,198 @@
+<section class="chapter" id="ch08" data-num="08" data-title="完整前向：从字符到概率" data-desc="20 个 token 穿过 2 层，最后落在 17 个候选上" data-desc-note="">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第八章 · 完整前向</div>
+    <h2>完整前向：从字符到概率</h2>
+    <p class="lead">零件齐了。这一章把它们装起来，从字符串 <code>the cat sat on the m</code> 出发，一路算到最后输出的概率分布。每一行都是这个训练好的小模型的真实输出，不是示意。读完这一章，你应该能在纸上把任意一个 token 的前向过程复现出来。</p>
+  </div>
+
+  <h3>第 0 步：字符串变成矩阵</h3>
+  <p>分词器把这 20 个字符映射成 20 个整数（字符级，每个字符一个 token）：</p>
+
+  <div class="tokline"><span class="tok">t</span><span class="tok">h</span><span class="tok">e</span><span class="tok">␣</span><span class="tok">c</span><span class="tok">a</span><span class="tok">t</span><span class="tok">␣</span><span class="tok">s</span><span class="tok">a</span><span class="tok">t</span><span class="tok">␣</span><span class="tok">o</span><span class="tok">n</span><span class="tok">␣</span><span class="tok">t</span><span class="tok">h</span><span class="tok">e</span><span class="tok">␣</span><span class="tok">m</span></div>
+
+  <div class="calc">
+    <div class="calc-title">输入整理</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">ids</div><div class="calc-val">[15, 7, 5, 0, 3, 2, 15, 0, 14, 2, 15, 0, 12, 11, 0, 15, 7, 5, 0, 10]</div></div>
+      <div class="calc-row"><div class="calc-label">嵌入 + 位置</div><div class="calc-val">X = wte[ids] + wpe[0:20]　<span class="shape">[20, 8]</span></div></div>
+      <div class="calc-row"><div class="calc-label">我们只跟踪最后一行</div><div class="calc-val">位置 19（字符 m）的 x = [−1.5651, 0.8432, 0.6085, −0.8543, 0.5743, 0.6986, 1.0881, −0.2305]</div></div>
+    </div>
+  </div>
+
+  <p>其余 19 行形状完全相同，也各自带着自己的内容。下面的每一步都同时作用在 20 行上，但为了看得清，我们只打印第 19 行。</p>
+
+  <h3>第 1 层</h3>
+  <p><b>① 归一化 + 投影出 Q / K / V。</b>20 行都要做，第 19 行得到：</p>
+
+  <div class="calc">
+    <div class="calc-title">第 1 层 · LN 与 QKV</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">LN(x) = a</div><div class="calc-val">[−2.2215, 1.1554, 0.4807, −1.6514, 0.1775, 0.5562, 1.5788, −0.3015]</div></div>
+      <div class="calc-row"><div class="calc-label">q = a·W_Q</div><div class="calc-val">[1.2184, 1.7456, 1.3819, 0.4668 | 0.4338, 0.6030, −1.0351, 2.6107]</div></div>
+      <div class="calc-row"><div class="calc-label">k = a·W_K</div><div class="calc-val">[−1.2277, −2.9444, −1.0647, 0.4709 | −1.0433, −1.1363, 0.0758, 0.0491]</div></div>
+      <div class="calc-row"><div class="calc-label">v = a·W_V</div><div class="calc-val">[−0.4326, −2.2233, 0.8966, −0.5234 | −1.7925, 0.4292, 0.6777, −0.0663]</div></div>
+    </div>
+  </div>
+
+  <p><b>② 两个头各自打分、softmax、加权求和。</b>head 0 的权重（第 5 章算过）集中在第 18 位空格（33.5%）和第 16 位 h（21.8%），head 1 集中在第 12 位 o（18.5%）。两头的输出拼起来再乘 \(W_O\)：</p>
+
+  <div class="calc">
+    <div class="calc-title">第 1 层 · 注意力输出</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">head 0</div><div class="calc-val">[0.1115, 0.4045, −0.0704, 0.1114]</div></div>
+      <div class="calc-row"><div class="calc-label">head 1</div><div class="calc-val">[−0.0616, 0.4743, 0.4286, −0.2777]</div></div>
+      <div class="calc-row"><div class="calc-label">concat·W_O = o</div><div class="calc-val">[−0.0850, −0.0369, 0.2465, −0.1577, 0.1771, 0.1589, −0.4437, 0.5405]</div></div>
+    </div>
+  </div>
+
+  <p><b>③ 残差相加。</b>\(x_1 = x + o\)：</p>
+
+  <div class="calc">
+    <div class="calc-title">第 1 层 · 残差 1</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">x₁</div><div class="calc-val">[−1.6501, 0.8063, 0.8550, −1.0120, 0.7514, 0.8575, 0.6444, 0.3099]</div></div>
+    </div>
+  </div>
+
+  <p><b>④ 前馈网络。</b>\(b = \mathrm{LN}(x_1)\)，\(u=bW_1\)，\(\mathrm{act}=\mathrm{GELU}(u)\)，\(y=\mathrm{act}W_2\)：</p>
+
+  <div class="calc">
+    <div class="calc-title">第 1 层 · 前馈网络</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">b <span class="shape">[8]</span></div><div class="calc-val">[−2.4641, 0.7416, 0.6498, −1.5981, 0.5259, 0.6144, 0.1019, 0.1396]</div></div>
+      <div class="calc-row"><div class="calc-label">u <span class="shape">[16]</span></div><div class="calc-val">[2.9289, −0.1383, −0.4472, −0.2923, −0.8060, −1.1141, −0.0076, −0.2453, −1.3510, 1.7941, 0.2537, −0.8691, −4.1551, −0.5081, −3.0533, 1.8288]</div></div>
+      <div class="calc-row"><div class="calc-label">act <span class="shape">[16]</span></div><div class="calc-val">[2.9243, −0.0615, −0.1464, −0.1125, −0.1694, −0.1479, −0.0038, −0.0989, −0.1196, 1.7287, 0.1522, −0.1673, −0.0000, −0.1553, −0.0031, 1.7671]</div></div>
+      <div class="calc-row"><div class="calc-label">y <span class="shape">[8]</span></div><div class="calc-val">[1.4417, −3.0897, −0.8570, −1.7572, −0.6499, −1.9208, 1.0026, 0.0291]</div></div>
+      <div class="calc-row"><div class="calc-label">x₂ = x₁ + y</div><div class="calc-val"><span class="pos">[−0.2084, −2.2835, −0.0020, −2.7692, 0.1014, −1.0633, 1.6470, 0.3390]</span></div></div>
+    </div>
+  </div>
+
+  <p>第 1 层结束。x₂ 就是第 2 层的输入。</p>
+
+  <h3>第 2 层</h3>
+  <p>第 2 层做一模一样的事，只是参数换了一套。下面把全部关键中间量一次列完：</p>
+
+  <div class="calc">
+    <div class="calc-title">第 2 层 · 全部中间量（位置 19）</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">x <span class="shape">[8]</span></div><div class="calc-val">[−0.2084, −2.2835, −0.0020, −2.7692, 0.1014, −1.0633, 1.6470, 0.3390]</div></div>
+      <div class="calc-row"><div class="calc-label">LN(x) = a₂</div><div class="calc-val">[0.1298, −1.6306, 0.5306, −1.9383, 0.4867, −0.3695, 1.0776, 0.5422]</div></div>
+      <div class="calc-row"><div class="calc-label">q</div><div class="calc-val">[−0.2474, 0.0026, 0.0293, −1.1099 | 0.0573, 2.7656, 1.8566, −0.3663]</div></div>
+      <div class="calc-row"><div class="calc-label">注意力输出 o</div><div class="calc-val">[1.2237, 0.4214, 0.9607, −0.2183, 0.3269, 0.2796, −0.6468, −2.7025]</div></div>
+      <div class="calc-row"><div class="calc-label">x₁ = x + o</div><div class="calc-val">[1.0153, −1.8621, 0.9587, −2.9875, 0.4284, −0.7836, 1.0002, −2.3634]</div></div>
+      <div class="calc-row"><div class="calc-label">b = LN(x₁)</div><div class="calc-val">[2.2577, −1.1674, 1.6258, −1.5533, 0.1593, −0.7389, 0.7846, −1.7749]</div></div>
+      <div class="calc-row"><div class="calc-label">u <span class="shape">[16]</span></div><div class="calc-val">[−4.0368, −1.6039, −1.0477, −2.8961, −1.3404, 1.4847, −2.6753, −1.3064, 5.6561, −2.4380, −0.1257, −3.1186, 1.2644, 3.3244, 0.7133, 0.0748]</div></div>
+      <div class="calc-row"><div class="calc-label">act</div><div class="calc-val">[−0.0001, −0.0874, −0.1546, −0.0050, −0.1209, 1.3823, −0.0095, −0.1253, 5.6561, −0.0176, −0.0566, −0.0025, 1.1339, 3.3232, 0.5436, 0.0396]</div></div>
+      <div class="calc-row"><div class="calc-label">y</div><div class="calc-val">[0.0544, 2.4397, −8.7410, 1.5465, −0.5822, −1.5382, 2.8947, 0.3074]</div></div>
+      <div class="calc-row"><div class="calc-label">x₂ = x₁ + y</div><div class="calc-val"><span class="pos">[1.0697, 0.5776, −7.7823, −1.4410, −0.1538, −2.3218, 3.8949, −2.0561]</span></div></div>
+    </div>
+  </div>
+
+  <p>第 2 层的注意力输出明显比第 1 层大（模长 3.3 对 0.8），前馈输出也更大。层越深，模型越"敢"改写表示。</p>
+
+  <h3>最后一步：投影到 17 个候选</h3>
+  <p>先把 \(x_2\) 归一化，再过输出层：</p>
+
+  <div class="calc">
+    <div class="calc-title">输出前的 LN 与 logits</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">LN(x₂) = x̂</div><div class="calc-val">[0.6608, 0.5057, −2.1297, −0.1306, 0.2751, −0.4083, 1.5515, −0.3245]</div></div>
+      <div class="calc-row"><div class="calc-label">× γ_final</div><div class="calc-val">γ = [4.223, 5.030, 4.828, 4.877, 3.527, 6.170, 5.858, 4.766]</div></div>
+      <div class="calc-row"><div class="calc-label">最终隐藏状态 hf <span class="shape">[8]</span></div><div class="calc-val">[2.6092, 2.0342, −10.3805, −0.3596, 1.2691, −2.4863, 10.1429, −0.9678]</div></div>
+      <div class="calc-row"><div class="calc-label">logits = hf·Wᵀ <span class="shape">[17]</span></div><div class="calc-val">输出层与词嵌入共享同一个矩阵（weight tying）：第 i 个候选的分数就是 hf 与该字符嵌入的点积</div></div>
+    </div>
+  </div>
+
+  <p>以字符 <b>a</b> 为例，它的嵌入是 <b>a</b> 那一行（<code>wte[2]</code>），分数是 8 个乘积之和：</p>
+
+  <div class="calc">
+    <div class="calc-title">logit(a) 的逐项分解</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">wte[a]</div><div class="calc-val">[0.1452, −1.0965, −1.0106, 0.1121, −0.0511, −0.1663, 1.6555, 0.3449]</div></div>
+      <div class="calc-row"><div class="calc-label">hf ⊙ wte[a]</div><div class="calc-val">[0.3789, −2.2306, 10.4905, −0.0403, −0.0648, 0.4135, 16.7918, −0.3337]</div></div>
+      <div class="calc-row"><div class="calc-label">求和</div><div class="calc-val"><span class="pos">25.4052</span>　其中第 6 维（hf=10.14，嵌入=1.66）一个人贡献了 16.79</div></div>
+    </div>
+  </div>
+
+  <p>17 个候选各算一次点积，得到 17 个分数：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>字符</th><th>logit</th><th>概率</th><th>字符</th><th>logit</th><th>概率</th></tr></thead>
+      <tbody>
+        <tr><td><b>a</b></td><td>25.4052</td><td><b>0.99865</b></td><td>w</td><td>18.3722</td><td>0.00088</td></tr>
+        <tr><td>.</td><td>17.7327</td><td>0.00046</td><td>d</td><td>13.1847</td><td>0.000005</td></tr>
+        <tr><td>l</td><td>11.8495</td><td>0.000001</td><td>h</td><td>10.7323</td><td>≈0</td></tr>
+        <tr><td>r</td><td>10.1155</td><td>≈0</td><td>i</td><td>8.6264</td><td>≈0</td></tr>
+        <tr><td>␣</td><td>5.8092</td><td>≈0</td><td>s</td><td>4.9165</td><td>≈0</td></tr>
+        <tr><td>t</td><td>3.9968</td><td>≈0</td><td>n</td><td>1.4543</td><td>≈0</td></tr>
+        <tr><td>m</td><td>−0.0546</td><td>≈0</td><td>c</td><td>−5.3888</td><td>≈0</td></tr>
+        <tr><td>o</td><td>−11.5926</td><td>≈0</td><td>e</td><td>−12.1840</td><td>≈0</td></tr>
+        <tr><td>g</td><td>−15.3888</td><td>≈0</td><td colspan="3"></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>softmax 之后，第一名拿到 99.87%，第二名 w 只有 0.09%。这个分布非常"自信"——因为训练充分、句子又高度刻板。</p>
+
+  <h3>算损失：模型有多惊讶</h3>
+  <p>真实的下一个字符是 <b>a</b>。交叉熵损失就是"给正确答案分配的概率的负对数"：</p>
+
+  <div class="equation">
+    \[ \mathcal{L} = -\ln p(\text{a}) = -\ln 0.99865 = 0.00135 \]
+    <span class="eqno">8.1</span>
+  </div>
+
+  <p>这个位置上模型几乎不感到惊讶。但整句话不是每个位置都这么好猜。20 个位置各自的损失：</p>
+
+  <div class="calc">
+    <div class="calc-title">20 个位置的损失</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">逐位置</div><div class="calc-val">[0.874, 0.001, 0.000, 3.116, 0.000, 0.000, 0.323, 0.567, 0.000, 0.000, 0.651, 0.033, 0.016, 0.000, 0.000, 0.000, 0.000, 0.000, 0.854, 0.001]</div></div>
+      <div class="calc-row"><div class="calc-label">平均</div><div class="calc-val">0.3218　（训练时报告的是 0.182，那是整个 batch 的平均）</div></div>
+      <div class="calc-row"><div class="calc-label">最难的位置</div><div class="calc-val">第 4 个位置（刚打完 "the "，它更想接 m 或 l）偏要接 c，损失 3.12；第 1 个位置预测 h 损失 0.87；第 19 个位置（空格）在 l/m 之间犹豫，损失 0.85</div></div>
+    </div>
+  </div>
+
+  <p>注意第 18 位（<code>the cat sat on the ␣</code>）：模型在 "l"（0.569）和 "m"（0.426）之间犹豫，因为语料里 "on the log" 和 "on the mat" 都出现过。到第 19 位拿到 "m" 之后，它立刻确定下一个是 "a"。这正是自回归生成的样子：<b>每多一个字符，不确定性就塌缩一次</b>。</p>
+
+  <h3>形状总账</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>阶段</th><th>张量</th><th>形状</th><th>参数量</th></tr></thead>
+      <tbody>
+        <tr><td>输入</td><td>ids</td><td>[20]</td><td>—</td></tr>
+        <tr><td>嵌入</td><td>X = wte[ids] + wpe</td><td>[20, 8]</td><td>136 + 320</td></tr>
+        <tr><td>每层 · LN1</td><td>a</td><td>[20, 8]</td><td>16</td></tr>
+        <tr><td>每层 · QKV</td><td>q, k, v</td><td>各 [20, 8]</td><td>3 × 64</td></tr>
+        <tr><td>每层 · 注意力</td><td>scores / weights</td><td>[2, 20, 20]</td><td>0</td></tr>
+        <tr><td>每层 · 输出投影</td><td>o</td><td>[20, 8]</td><td>64</td></tr>
+        <tr><td>每层 · FFN</td><td>u / act / y</td><td>[20,16] / [20,16] / [20,8]</td><td>280</td></tr>
+        <tr><td>输出</td><td>logits → probs</td><td>[20, 17]</td><td>0（共享 wte）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>这一趟花了多少计算</h3>
+  <p>粗略地，一次前向的浮点运算量约等于 \(2\times\) 参数量 \(\times\) token 数。本模型：\(2\times1608\times20\approx6.4\) 万次浮点运算。同样的公式用在 GPT-3 上：\(2\times1750\) 亿 \(\times 1 = 3500\) 亿次——<b>每生成一个 token</b>。</p>
+
+  <div class="calc">
+    <div class="calc-title">横向对比：生成一个 token 的计算量</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">本页小模型</div><div class="calc-val">2 × 1608 ≈ 3.2 千 FLOPs</div></div>
+      <div class="calc-row"><div class="calc-label">Llama 3 8B</div><div class="calc-val">2 × 8.0e9 ≈ 16 GFLOPs</div></div>
+      <div class="calc-row"><div class="calc-label">GPT-3 175B</div><div class="calc-val">2 × 1.75e11 ≈ 350 GFLOPs</div></div>
+      <div class="calc-row"><div class="calc-label">一张 H100（FP16）</div><div class="calc-val">约 990 TFLOPS 峰值，跑 350 GFLOPs 理论上 0.35 毫秒；实际受显存带宽限制，通常几十毫秒</div></div>
+    </div>
+  </div>
+
+  <div class="keyidea">
+    <b>小结</b>
+    <p>一个 token 的生成 = 一行 8 维向量，穿过 2 个"注意力 + 前馈"块，每一次都被加上一个增量、每隔一步被归一化，最后点乘 17 个字符嵌入得到分数，softmax 成概率。大模型做的是完全相同的事，只是把 8 换成 4096、2 层换成 32 层、17 个字符换成 12.8 万个 token。</p>
+  </div>
+
+  <div class="note">
+    <b>下一章</b>
+    <p>概率分布已经算出来了，但"选哪个"是另一个问题。贪心地选最大概率会得到重复、死板的文本；按概率随机抽又可能抽到离谱的词。温度、top-k、top-p 就是在调这个旋钮。</p>
+  </div>
+</section>

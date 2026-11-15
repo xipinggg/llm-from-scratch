@@ -1,0 +1,218 @@
+<section class="chapter" id="ch14" data-num="14" data-title="推理加速：量化、投机解码与约束解码" data-desc="均匀量化的误差与粒度、GPTQ/AWQ/SmoothQuant/FP8、量化 kernel、投机解码与验证、grammar 掩码">
+  <div class="chapter-head">
+    <div class="chapter-kicker">第十四章 · 推理加速</div>
+    <h2>推理加速：量化、投机解码与约束解码</h2>
+    <p class="lead">前面几章解释了为什么 decode 慢：每生成一个 token 要把全部权重从显存搬到 SM，而算力大量闲置。这一章讲工程上真正把这块时间砍下去的三件事——把数字变小（量化）、把串行变并行（投机解码）、把不合法的输出直接剪掉（约束解码）。三件事各自能省一半以上，叠起来就是一个数量级。</p>
+  </div>
+
+  <h3>量化的三个自由度</h3>
+  <p>"量化"这个词被用得太宽。落到一个具体的方案上，必须先回答三个问题，答案不同就是完全不同的技术：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>问题</th><th>选项</th><th>影响</th></tr></thead>
+      <tbody>
+        <tr><td>量化什么</td><td>只量化权重（W-only）、权重与激活（W8A8）、连 KV cache 一起量化</td><td>权重省显存与带宽；激活决定 GEMM 能否用整数/FP8 Tensor Core；KV 决定并发</td></tr>
+        <tr><td>用什么粒度</td><td>整个张量一个缩放（per-tensor）、每行一个（per-channel）、每 128 个元素一个（per-group）</td><td>粒度越细误差越小，但缩放参数的存储与访存开销越大</td></tr>
+        <tr><td>什么时候量化</td><td>训练后量化（PTQ）、量化感知训练（QAT）</td><td>PTQ 便宜、精度略降；QAT 要在训练里模拟量化，成本高但能救回精度</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>大多数线上部署走的是"权重 4bit、激活 fp16、KV 8bit"这条路：它只改读权重的带宽，不需要重训，也不改模型的算子结构。</p>
+
+  <h3>均匀量化：一个缩放系数加一个零点</h3>
+  <p>最常用的是仿射均匀量化。给定位宽 \(b\)、缩放 \(s\) 和零点 \(z\)，把一个浮点数压成整数再还原：</p>
+
+  <div class="equation">
+    \[ q = \operatorname{clamp}\!\left(\operatorname{round}\!\left(\frac{x}{s}\right) + z,\; q_{\min},\; q_{\max}\right), \qquad \hat{x} = s\,(q - z) \]
+    <span class="eqno">14.1</span>
+  </div>
+
+  <p>对称量化让 \(z=0\)，只留缩放：\(s = \max|x| / (2^{b-1}-1)\)。于是每个数的误差不超过半个步长：</p>
+
+  <div class="equation">
+    \[ |x - \hat{x}| \le \frac{s}{2} = \frac{\max|x|}{2\,(2^{b-1}-1)} \]
+    <span class="eqno">14.2</span>
+  </div>
+
+  <p>这个式子解释了两件事。第一，位宽每少 1 位，步长翻倍，误差也翻倍。第二，<b>误差取决于这一组里最大的那个数</b>——一个离群值会把整组的步长撑大，把其余小数压成同一个值。</p>
+
+  <p>不同格式的差别就在位怎么分配。fp16 有 5 位指数、10 位尾数；bf16 用 8 位指数换 7 位尾数，动态范围与 fp32 同级；fp8 分成 e4m3（范围约 ±448，精度好）和 e5m2（范围大、精度差）；int8 与 int4 是指数都没有的定点数，必须靠缩放把数据搬进量程。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>格式</th><th>位宽</th><th>动态范围</th><th>典型用法</th></tr></thead>
+      <tbody>
+        <tr><td>fp16 / bf16</td><td>16</td><td>大</td><td>基线；bf16 训练与推理的默认</td></tr>
+        <tr><td>fp8 e4m3</td><td>8</td><td>±448</td><td>权重与 KV 缓存，H100 上 Tensor Core 原生支持</td></tr>
+        <tr><td>fp8 e5m2</td><td>8</td><td>±57344</td><td>需要更大范围的中间量，精度更差</td></tr>
+        <tr><td>int8</td><td>8</td><td>±127（对称）</td><td>W8A8，需要校准或动态缩放</td></tr>
+        <tr><td>int4</td><td>4</td><td>±7（对称）</td><td>权重-only，配合 per-group 缩放</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>粒度：为什么大模型必须分组</h3>
+  <p>权重的分布在不同通道之间差别很大，而少数通道的取值可以比中位数大一个数量级。整张量一个缩放时，这些离群值会把步长撑到很大，普通权重全部被压到少数几个整数上。工程上的解法是分组：把一行权重切成若干组（常见 128），每组一个缩放。存储代价是每 128 个 4bit 数多一个 fp16 缩放，约 0.4 bit/参数。</p>
+
+  <p>下面的演示用 96 个权重（含两个离群值）对比不同粒度的重建误差。把"分组大小"从 96 拉到 8，看误差怎么塌下去：</p>
+
+  <div class="demo" data-demo="quant">
+    <div class="demo-head">
+      <span class="badge">交互</span>
+      <b>量化粒度与重建误差</b>
+      <span class="hint">调分组大小与位宽</span>
+    </div>
+    <div class="demo-body">
+      <div class="controls">
+        <label class="ctl"><span>位宽</span>
+          <div class="seg" id="q-bits"><button data-b="8">int8</button><button data-b="4" class="on">int4</button><button data-b="3">int3</button></div>
+        </label>
+        <label class="ctl"><span>分组大小</span><input id="q-group" type="range" min="2" max="96" step="2" value="96"><b id="q-group-out">96（整行一组）</b></label>
+      </div>
+      <canvas id="q-canvas" style="width:100%;display:block;height:220px"></canvas>
+      <div class="kv-io">
+        <div class="kv-stat"><div class="k">最大误差</div><div class="v" id="q-max">—</div></div>
+        <div class="kv-stat"><div class="k">均方根误差</div><div class="v" id="q-rmse">—</div></div>
+        <div class="kv-stat"><div class="k">量化后的余弦相似度</div><div class="v" id="q-cos">—</div></div>
+        <div class="kv-stat"><div class="k">步长（中位 / 最大）</div><div class="v" id="q-step">—</div></div>
+      </div>
+      <div class="calc-note" id="q-note"></div>
+    </div>
+  </div>
+
+  <h3>激活才是难点：离群值与 SmoothQuant</h3>
+  <p>权重可以离线慢慢校准，激活不行——它每层、每个 batch 都在变，而且 LLM 的激活里有著名的"离群通道"：极少数特征维度的绝对值能比其余大 20–100 倍。直接对激活做 int8，这些通道一压，模型输出就崩了。</p>
+
+  <p>SmoothQuant 的思路是把难度从激活搬到权重上。对每个输入通道 \(j\) 乘一个缩放 \(1/s_j\)，同时把权重的对应列乘 \(s_j\)，数学上完全等价：</p>
+
+  <div class="equation">
+    \[ \mathbf{Y} = (\mathbf{X}\,\mathrm{diag}(1/s))\,(\mathrm{diag}(s)\,\mathbf{W}), \qquad s_j = \frac{\max|X_j|^{\alpha}}{\max|W_j|^{1-\alpha}} \]
+    <span class="eqno">14.3</span>
+  </div>
+
+  <p>\(\alpha\) 取 0.5 左右，意思是"让激活和权重的动态范围各退一步"。搬完之后激活的离群值被压平，权重那一列的动态范围变大但仍可量化，于是 W8A8 的整数 GEMM 才有可能。</p>
+
+  <h3>GPTQ 与 AWQ：两种不同的补偿</h3>
+  <p>朴素地"四舍五入到 4bit"在 7B 以上的模型上会掉很多分。两个主流方法都想在量化时把误差补回来，但补偿的对象不同。</p>
+
+  <p><b>GPTQ</b> 是逐层、逐列的量化：量化一列之后，用剩余的输入统计量把这一列造成的输出误差"摊"到还没量化的列上。它需要一小批校准数据来估计 Hessian：</p>
+
+  <div class="equation">
+    \[ \mathbf{H} = 2\,\mathbf{X}\mathbf{X}^{\top}, \qquad \delta_{j} = -\,\frac{w_j - \hat{w}_j}{[\mathbf{H}^{-1}]_{jj}}\;[\mathbf{H}^{-1}]_{:,j} \]
+    <span class="eqno">14.4</span>
+  </div>
+
+  <p>直观理解：每次量化都欠了一笔误差，就用其余权重微调来还债，让这一层的<b>输出</b>尽量不变。代价是要对每一层解一个逆矩阵，量化一个 8B 模型通常要几十分钟到几小时。</p>
+
+  <p><b>AWQ</b> 走的是另一条路：不逐列补偿，而是先找"重要"通道（看激活的幅度），给这些通道放大再量化，最后把缩放折回去。它在校准集上搜索一个很小的缩放指数，通常在校准几十条样本后就能量化，速度比 GPTQ 快很多，4bit 下的精度也常常更好。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>方法</th><th>要校准什么</th><th>典型位宽</th><th>特点</th></tr></thead>
+      <tbody>
+        <tr><td>GPTQ</td><td>每层输入的 Hessian</td><td>4bit / 3bit（group 128）</td><td>精度稳；量化慢；对校准集敏感</td></tr>
+        <tr><td>AWQ</td><td>激活幅度，搜索缩放</td><td>4bit（group 128）</td><td>快；保护显著通道；kernel 实现成熟</td></tr>
+        <tr><td>SmoothQuant</td><td>激活的最大值</td><td>W8A8</td><td>让整数激活可行；常与 GPTQ 叠加</td></tr>
+        <tr><td>FP8（动态缩放）</td><td>不需要校准集</td><td>W8A8 / KV8</td><td>H100 原生支持，实现最简单</td></tr>
+        <tr><td>QLoRA</td><td>无（微调时量化）</td><td>4bit 权重 + bf16 适配器</td><td>不是推理方案，但常被拿来省显存微调</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>量化后的 kernel 长什么样</h3>
+  <p>光把权重存成 4bit 不够，还得有 kernel 能在计算时把它还原。这里有个关键区别：</p>
+
+  <p>如果在算之前先把整块权重反量化成 fp16，那你又要把 16bit 的数据搬一遍，带宽一点没省——所以要<b>在 GEMM 内部边取边还原</b>。Marlin 这类 kernel 的做法是：把 4bit 权重按张量核心需要的内存布局重排，计算时用异步拷贝把分块搬进共享内存，反量化后直接喂给张量核心的指令，缩放因子也按同样的分块布局排好，避免额外的地址计算。</p>
+
+  <p>这带来两个工程后果。第一，<b>量化只对带宽瓶颈的阶段有效</b>：decode 时权重读取是瓶颈，收益接近线性；prefill 是算力瓶颈，收益要看整数算力是否能顶上。第二，<b>小 batch 收益最大</b>：batch 越大，每份权重摊到的计算越多，瓶颈从带宽转向算力，4bit 的相对收益就下降。</p>
+
+  <div class="calc">
+    <div class="calc-title">同一张 H100、同一个 8B 模型：量化对 decode 的影响</div>
+    <div class="calc-body">
+      <div class="calc-row"><div class="calc-label">fp16 权重</div><div class="calc-val">16.06 GB → 按 3.35 TB/s 读一遍约 4.8 毫秒/token</div></div>
+      <div class="calc-row"><div class="calc-label">int8 权重</div><div class="calc-val">8.03 GB → 约 2.4 毫秒/token</div></div>
+      <div class="calc-row"><div class="calc-label">int4 权重</div><div class="calc-val">4.02 GB → 约 1.2 毫秒/token</div></div>
+      <div class="calc-row"><div class="calc-label">代价</div><div class="calc-val">精度损失、反量化开销、prefill 收益小；长上下文与代码任务更敏感</div></div>
+    </div>
+  </div>
+
+  <h3>KV cache 量化：比权重量化更敏感</h3>
+  <p>权重量化一次、用一辈子；KV cache 是每个 token 现算出来的，量化误差会随上下文长度累积。三件事要分开看：</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>对象</th><th>分布特点</th><th>常用做法</th></tr></thead>
+      <tbody>
+        <tr><td>K（键）</td><td>通道方向有离群值；前几个 token 的幅度极大（attention sink）</td><td>按 token 或按头算缩放；sink token 保 fp16</td></tr>
+        <tr><td>V（值）</td><td>按 token 方向的离群值更明显</td><td>per-token 缩放；fp8 下通常够用</td></tr>
+        <tr><td>整体</td><td>长上下文时误差累积</td><td>KV 用 fp8（省一半）比 4bit 稳；4bit KV 一般要配合分组与 sink 保护</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>这也解释了第 11 章那个数字的意义：Llama 3 8B 的 KV 是 128 KB/token，换成 fp8 降到 64 KB；在一个 128K 上下文、50 路并发的场景里，这一半就是几十 GB 的可服务容量。</p>
+
+  <h3>投机解码：用并行算力换串行延迟</h3>
+  <p>decode 的根本矛盾是"每一步只出一个 token，却要读一遍全部权重"。投机解码把这件事改成：先用一个便宜的办法猜出后面 \(\gamma\) 个 token，再让大模型<b>一次前向</b>并行验证这 \(\gamma+1\) 个位置，最后按规则接受一个前缀。</p>
+
+  <p>关键在"按规则"。如果直接接受猜中的 token，输出分布就被改了；标准做法是逐位置做拒绝采样：草稿分布 \(q\)、目标分布 \(p\)，以 \(\min(1, p/q)\) 的概率接受，拒绝时从 \(\max(0, p-q)\) 归一化后的分布重采样。这个构造能严格保证输出分布与直接用大模型采样一致——所以它是"加速"，不是"近似"。</p>
+
+  <p>收益取决于两个量：接受率 \(\alpha\) 和草稿成本比 \(c\)。第 10 章给过的公式在这里可以直接用：</p>
+
+  <div class="equation">
+    \[ S \approx \frac{1-\alpha^{\gamma+1}}{(1-\alpha)(1+\gamma c)} \]
+    <span class="eqno">14.5</span>
+  </div>
+
+  <p>代入 \(\alpha=0.8\)、\(\gamma=4\)、\(c=0.05\)，得到约 2.6 倍。注意 \(\gamma\) 不是越大越好：\(\gamma\) 增大时分子趋近 1，分母里的 \(1+\gamma c\) 线性增长，最优值通常在 3–6 之间。这也是所有实现在"草稿长度"上做自适应调整的原因。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>草稿从哪来</th><th>做法</th><th>特点</th></tr></thead>
+      <tbody>
+        <tr><td>小模型</td><td>同系列的小号模型当草稿</td><td>通用；要额外显存与一次前向</td></tr>
+        <tr><td>Medusa 头</td><td>在目标模型上挂多个预测头，各自猜不同位置</td><td>不用第二个模型；需要树状验证</td></tr>
+        <tr><td>EAGLE</td><td>在特征层做自回归，复用目标模型的隐状态</td><td>接受率高；实现复杂</td></tr>
+        <tr><td>n-gram / 前缀查找</td><td>直接从上下文里复制可能的续写</td><td>零额外模型；摘要、RAG、代码补全上效果好</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>验证阶段要用"树注意力"：多个候选共享前缀，把树展平成一个序列，用自定义的注意力掩码让每个节点只能看见自己的祖先。这样一次前向就能验证几十个候选，而不是每个候选单独跑一遍。代价是注意力 kernel 要支持任意掩码，而且要和 CUDA graph、变长 decode 配合——这就是第 13 章说的"注意力最难进图"的另一面。</p>
+
+  <h3>约束解码：把不合法的 token 直接剪掉</h3>
+  <p>结构化输出（JSON、函数调用参数、SQL、正则）在线上非常常见，做法是把语法编译成一个状态机，每生成一个 token 就查一次"哪些 token 能让状态继续合法"，把其余 token 的 logits 置为负无穷。</p>
+
+  <p>流程可以写成四步：把 schema 编译成自动机；每一步根据当前状态算出允许的 token 集合；把不允许的位置掩掉；在剩下的分布上采样。掩码之后要重新归一化：</p>
+
+  <div class="equation">
+    \[ p'_i = \frac{p_i\, m_i}{\sum_j p_j\, m_j}, \qquad m_i \in \{0, 1\} \]
+    <span class="eqno">14.6</span>
+  </div>
+
+  <p>它和前面两个技术有冲突，必须一起考虑：温度与 top-p 要在掩码之后做（否则可能把合法 token 全剪掉）；投机解码的草稿 token 也必须过语法检查，验证时被拒绝的草稿要按掩码后的分布重采样；如果掩码每步现算，开销可能到几十微秒，所以成熟实现会预编译状态转移表、缓存每个状态的掩码位图。</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>方案</th><th>支持的约束</th><th>开销与限制</th></tr></thead>
+      <tbody>
+        <tr><td>JSON Schema 编译</td><td>对象、数组、枚举、必填字段</td><td>编译一次；schema 复杂时状态数会膨胀</td></tr>
+        <tr><td>正则 / 有限状态机</td><td>正则表达式、固定格式</td><td>每步查表；不能表达递归结构</td></tr>
+        <tr><td>上下文无关文法</td><td>嵌套结构、代码语法</td><td>用下推自动机；实现与开销都更重</td></tr>
+        <tr><td>工具调用参数</td><td>函数签名的 JSON</td><td>本质是 JSON Schema，另加"只输出一个调用"的约束</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="keyidea">
+    <b>这一章的要点</b>
+    <p>量化省的是带宽，所以对 decode 有效、对小 batch 最有效，粒度越细误差越小但开销越大；投机解码省的是串行步数，收益由接受率和草稿成本决定，且必须用拒绝采样保证分布不变；约束解码省的是"生成后再校验"的浪费，但要放在采样链路的正确位置。三者的共同点是：都建立在"decode 被带宽和串行性限制"这个前提上。</p>
+  </div>
+
+  <div class="note">
+    <b>下一章</b>
+    <p>量化让每个 token 更便宜，但上下文一长，KV cache 又会把省下来的显存吃回去。第 15 章讲长上下文：位置编码怎么外推、KV 怎么压缩、1M 上下文的账到底该怎么算。</p>
+  </div>
+</section>
