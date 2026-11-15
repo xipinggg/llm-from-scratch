@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 md/ 里生成的 Markdown 渲染成一个静态站点（site/）。
+"""把 md/ 里生成的 Markdown 渲染成一个静态站点（docs/，供 GitHub Pages 从 /docs 发布）。
 
 设计目标是给 GitHub Pages 用：每章一页、左侧目录、公式构建期渲染成
 静态 HTML（不依赖 KaTeX 运行时 JS）。Markdown 的子集正好就是
@@ -19,7 +19,7 @@ import build as B  # 复用 render_math / katex_css / NODE / ROOT
 
 ROOT = B.ROOT
 MD = os.path.join(ROOT, "md")
-OUT = os.path.join(ROOT, "site")
+OUT = os.path.join(ROOT, "docs")
 
 SENT_D = "\x02D{}\x03"
 SENT_I = "\x02I{}\x03"
@@ -366,7 +366,7 @@ def main():
         open(os.path.join(OUT, out_name), "w", encoding="utf-8").write(page)
         print(f"  {out_name:34s} {len(page) // 1024:4d} KB  {label}")
 
-    print(f"site: {len(pages)} pages | math: {len(math_items)}")
+    print(f"docs: {len(pages)} pages | math: {len(math_items)}")
 
 
 if __name__ == "__main__":

@@ -95,10 +95,10 @@ $PY tools/html2md.py
 
 ## 在线文档站（分支 `markdown`）
 
-`site/` 是由 Markdown 生成的静态站点（每章一页、左侧目录、公式在构建期渲染成静态 HTML），可直接用 GitHub Pages 托管：
+`docs/` 是由 Markdown 生成的静态站点（GitHub Pages 从 `main` 分支的 `/docs` 发布）（每章一页、左侧目录、公式在构建期渲染成静态 HTML），可直接用 GitHub Pages 托管：
 
 ```bash
-$PY tools/build_site.py     # 读取 md/ 生成 site/
+$PY tools/build_site.py     # 读取 md/ 生成 docs/
 ```
 
-生成物已提交，Pages 源设为 `markdown` 分支的 `/site` 目录即可在线阅读。
+在线地址：https://xipinggg.github.io/llm-from-scratch/（内容与 `docs/` 一致）
