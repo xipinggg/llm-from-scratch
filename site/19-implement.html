@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>从零实现：200 行 numpy · 大模型是怎么想出一个字的</title>
+<link rel="stylesheet" href="katex.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav>
+  <div class="brand">LLM · From Scratch</div>
+  <a href="index.html">目录与说明</a>
+  <a href="00-hero.html">00 · 怎么读这份材料</a>
+  <a href="01-overview.html">01 · 全景：一次推理的七个阶段</a>
+  <a href="02-math.html">02 · 必备数学：只有六件事</a>
+  <a href="03-tokenizer.html">03 · 分词：把文字变成整数</a>
+  <a href="04-embedding.html">04 · 嵌入：把整数变成向量</a>
+  <a href="05-attention.html">05 · 注意力：20 个位置怎么互相看</a>
+  <a href="06-residual-norm.html">06 · 残差与归一化：让 96 层也能训</a>
+  <a href="07-ffn.html">07 · 前馈网络：模型把知识存在哪</a>
+  <a href="08-forward-pass.html">08 · 完整前向：从字符到概率</a>
+  <a href="09-sampling.html">09 · 选哪个字：温度、top-k、top-p</a>
+  <a href="10-inference-engine.html">10 · 推理引擎：把 FLOPs 变成毫秒</a>
+  <a href="11-kv-cache.html">11 · KV cache：显存、带宽与并发</a>
+  <a href="12-serving-params.html">12 · 服务参数：vLLM 与 SGLang 调参</a>
+  <a href="13-gpu.html">13 · GPU 执行：一次 decode 是怎么落到硬件上的</a>
+  <a href="14-quant-spec.html">14 · 推理加速：量化、投机解码与约束解码</a>
+  <a href="15-long-context.html">15 · 长上下文：位置外推、KV 压缩与 1M 的账</a>
+  <a href="16-arch-variants.html">16 · 架构变体：MoE、MLA、Mamba 与 MTP</a>
+  <a href="17-training.html">17 · 训练：从下一个字到对齐人类</a>
+  <a href="18-reasoning.html">18 · 推理模型：让模型多想一想</a>
+  <a href="19-implement.html" class="on">19 · 从零实现：200 行 numpy</a>
+  <a href="20-agent.html">20 · Agent：让模型动手做事</a>
+  <a href="21-harness.html">21 · Harness：模型外面那一圈代码</a>
+  <a href="22-scale-faq.html">22 · 规模地图与常见误解</a>
+  <a href="23-exercises.html">23 · 习题与动手实验</a>
+  <a href="24-glossary.html">24 · 术语表</a>
+  <a href="25-source-reading.html">25 · 源码导读：读一个真实的注意力 kernel</a>
+  <a href="26-research-frontier.html">26 · 研究前沿：推理引擎正在往哪走</a>
+  <a href="book.html">合集（单页）</a>
+</nav>
+<main>
+  <div class="crumb">第十九章 · 从零实现</div>
+  <h1>从零实现：200 行 numpy</h1>
+<p>读懂和写出来是两件事。这一章把前面所有章节拼成一份能直接运行的代码：没有 PyTorch，没有自动微分，梯度全部手推。它训练出的模型就是本页所有数字的来源。</p>
+<h2>为什么值得亲手写一遍</h2>
+<p>用 PyTorch 搭一个 GPT 只要十几行，但那样会错过几件最容易忽略的事：</p>
+<ul><li><strong>梯度的形状</strong>：反向传播里每个矩阵乘法的维度为什么会变成那样？只有手写一遍才知道 <code>dW = Xᵀ dY</code> 是怎么来的；</li><li><strong>残差与归一化的耦合</strong>：LayerNorm 的反向公式里有两项残差修正，写错一项梯度就全错（作者本人踩过，见下文）；</li><li><strong>一个 epoch 到底在做什么</strong>：损失、学习率、batch、梯度累积、参数更新，这些词在框架里都是黑盒。</li></ul>
+<blockquote><p><strong>五段代码分别对应哪几章</strong></p>
+<p>语料与初始化（第 3–4 章）→ 基础算子与归一化（第 2、6 章）→ 前向（第 5、7、8 章）→ 反向（链式法则）→ 训练与生成（第 9、11 章）。这份实现对每个张量都保留中间量，所以后面才能导出第 5–8 章那张逐步演算表。</p></blockquote>
+<blockquote><p><strong>与本页数字的关系</strong></p>
+<p>本页第 5–11 章的数字由 <code>tools/toy_gpt.py</code>（同一份代码的完整版，多一个 trace 导出）生成。下面这份 <code>tools/gpt_min.py</code> 是它的精简版，算法完全一致，最终损失在 0.16–0.18（随机初始化与数据顺序略有不同）。运行 <code>python3 gpt_min.py</code> 约 30 秒。</p></blockquote>
+<h2>完整代码</h2>
+<p>先把代码分四段贴出来，每段后面解释关键行。文件在 <code>tools/gpt_min.py</code>。</p>
+<p>① 模块说明、语料与初始化</p>
+<pre><code class="language-python">&quot;&quot;&quot;
+GPT-min：一个 200 行以内、只用 numpy 的完整小型语言模型。
+前向、手写反向传播、Adam、训练、采样全在这里。
+
+架构：字符级，V=17，T=40，d_model=8，2 层，2 头（每头 4 维），FFN=16
+      pre-LN + 可学习绝对位置 + GELU + 权重共享输出头
+运行：python3 gpt_min.py           （约 30 秒，损失降到 0.16 附近）
+&quot;&quot;&quot;
+import math
+import numpy as np
+
+# ---------------------------------------------------------------- 1. 语料
+CORPUS = &quot;&quot;&quot;\
+the cat sat on the mat.
+the cat sat on the log.
+a cat sat on the mat.
+the dog sat on the mat.
+the dog sat on the log.
+the man sat on the mat.
+the man sat on the log.
+she sat on the mat.
+he sat on the log.
+the cat ate the rat.
+the rat ate the mat.
+the dog ate the rat.
+the cat is on the mat.
+the dog is on the log.
+the man is on the mat.
+the mat is on the log.
+a man sat on the log.
+the cat and the dog sat on the mat.
+the cat ran to the man.
+the dog ran to the cat.
+the man ran to the cat.
+i sat on the mat.
+we sat on the log.
+sit on the mat.
+a cat and a dog sat on the log.
+the rat ran to the mat.
+the man and the cat sat on the log.
+she ran to the man.
+he ran to the dog.
+the dog and the man ate the rat.
+on the mat sat a cat.
+on the log sat a dog.
+the cat sat.
+the dog ran.
+the man ate.
+the rat ran.
+the end.
+&quot;&quot;&quot;
+
+CORPUS = CORPUS.replace(&quot;\n&quot;, &quot;&quot;)
+VOCAB = sorted(set(CORPUS))
+V = len(VOCAB)
+STOI = {c: i for i, c in enumerate(VOCAB)}
+ITOS = {i: c for c, i in STOI.items()}
+data = np.array([STOI[c] for c in CORPUS], dtype=np.int64)
+
+T, D, L, H = 40, 8, 2, 2
+DH = D // H
+F = 16
+EPS = 1e-5
+GELU_C = math.sqrt(2.0 / math.pi)
+rng = np.random.default_rng(20241115)
+
+# ---------------------------------------------------------------- 2. 初始化
+def init_params(rng):
+    def randn(*shape, std=0.08):
+        return rng.normal(0.0, std, size=shape)
+
+    p = {&quot;wte&quot;: randn(V, D, std=0.3), &quot;wpe&quot;: randn(T, D, std=0.05)}
+    for l in range(L):
+        p[f&quot;ln1g{l}&quot;], p[f&quot;ln1b{l}&quot;] = np.ones(D), np.zeros(D)
+        p[f&quot;wq{l}&quot;] = randn(D, D, std=0.35)
+        p[f&quot;wk{l}&quot;] = randn(D, D, std=0.35)
+        p[f&quot;wv{l}&quot;] = randn(D, D, std=0.35)
+        p[f&quot;wo{l}&quot;] = randn(D, D, std=0.25)
+        p[f&quot;ln2g{l}&quot;], p[f&quot;ln2b{l}&quot;] = np.ones(D), np.zeros(D)
+        p[f&quot;w1{l}&quot;] = randn(D, F, std=0.35)
+        p[f&quot;b1{l}&quot;] = np.zeros(F)
+        p[f&quot;w2{l}&quot;] = randn(F, D, std=0.25)
+        p[f&quot;b2{l}&quot;] = np.zeros(D)
+    p[&quot;lnfg&quot;], p[&quot;lnfb&quot;] = np.ones(D), np.zeros(D)
+    return p
+
+# ---------------------------------------------------------------- 3. 基础算子
+def layer_norm(x, g, b):
+    mu = x.mean(-1, keepdims=True)
+    xc = x - mu
+    var = (xc ** 2).mean(-1, keepdims=True)
+    rstd = 1.0 / np.sqrt(var + EPS)
+    xhat = xc * rstd
+    return xhat * g + b, (xhat, rstd)
+
+def layer_norm_backward(dy, xhat, rstd, g):
+    n = xhat.shape[-1]
+    dg = (dy * xhat).sum(0)
+    db = dy.sum(0)
+    dxhat = dy * g
+    dvar = (dxhat * xhat).sum(-1, keepdims=True) * (-0.5) * rstd ** 2
+    dmu = (-dxhat * rstd).sum(-1, keepdims=True) \
+          + dvar * (-2.0 / n) * (xhat / rstd).sum(-1, keepdims=True)
+    dx = dxhat * rstd + dvar * 2.0 * (xhat / rstd) / n + dmu / n
+    return dx, dg, db
+
+def gelu(x):
+    t = np.tanh(GELU_C * (x + 0.044715 * x ** 3))
+    return 0.5 * x * (1.0 + t), t
+
+def gelu_backward(dy, x, t):
+    dt = 0.5 * x * (1.0 - t ** 2) * GELU_C * (1.0 + 3 * 0.044715 * x ** 2)
+    return dy * (0.5 * (1.0 + t) + dt)
+
+def softmax(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def causal_mask(tn):
+    return np.triu(np.full((tn, tn), -1e9), k=1)</code></pre>
+<p>② 前向传播</p>
+<pre><code class="language-python"># ---------------------------------------------------------------- 4. 前向
+def forward(p, ids, keep=False):
+    B, tn = ids.shape
+    x = p[&quot;wte&quot;][ids] + p[&quot;wpe&quot;][None, :tn, :]
+    cache = {&quot;ids&quot;: ids, &quot;layers&quot;: []}
+    for l in range(L):
+        lc = {}
+        a, (xhat, rstd) = layer_norm(x, p[f&quot;ln1g{l}&quot;], p[f&quot;ln1b{l}&quot;])
+        q, k, v = a @ p[f&quot;wq{l}&quot;], a @ p[f&quot;wk{l}&quot;], a @ p[f&quot;wv{l}&quot;]
+        lc.update(a=a, xhat=xhat, rstd=rstd, q=q, k=k, v=v)
+        outs, atts = [], []
+        for h in range(H):
+            sl = slice(h * DH, (h + 1) * DH)
+            sc = q[:, :, sl] @ k[:, :, sl].transpose(0, 2, 1) / math.sqrt(DH)
+            at = softmax(sc + causal_mask(tn)[None], -1)
+            outs.append(at @ v[:, :, sl])
+            atts.append(at)
+        o = np.concatenate(outs, -1) @ p[f&quot;wo{l}&quot;]
+        x = x + o
+        lc.update(att=np.stack(atts, 1), o=o, x1=x)
+        b, (bhat, brstd) = layer_norm(x, p[f&quot;ln2g{l}&quot;], p[f&quot;ln2b{l}&quot;])
+        u = b @ p[f&quot;w1{l}&quot;] + p[f&quot;b1{l}&quot;]
+        act, gt = gelu(u)
+        y = act @ p[f&quot;w2{l}&quot;] + p[f&quot;b2{l}&quot;]
+        x = x + y
+        lc.update(b=b, bhat=bhat, brstd=brstd, u=u, act=act, gelu_t=gt, y=y, x2=x)
+        cache[&quot;layers&quot;].append(lc)
+    hf, (fh, frstd) = layer_norm(x, p[&quot;lnfg&quot;], p[&quot;lnfb&quot;])
+    logits = hf @ p[&quot;wte&quot;].T          # 权重共享：输出头就是 wte
+    cache.update(hf=hf, hf_xhat=fh, hf_rstd=frstd)
+    return (logits, cache) if keep else logits</code></pre>
+<p>③ 手写反向传播</p>
+<pre><code class="language-python"># ---------------------------------------------------------------- 5. 反向
+def backward(p, cache, dlogits):
+    g = {k: np.zeros_like(v) for k, v in p.items()}
+    g[&quot;wte&quot;] += dlogits.reshape(-1, V).T @ cache[&quot;hf&quot;].reshape(-1, D)
+    dhf = dlogits @ p[&quot;wte&quot;]
+    dx, g[&quot;lnfg&quot;], g[&quot;lnfb&quot;] = layer_norm_backward(
+        dhf.reshape(-1, D), cache[&quot;hf_xhat&quot;].reshape(-1, D),
+        cache[&quot;hf_rstd&quot;].reshape(-1, 1), p[&quot;lnfg&quot;])
+    dx = dx.reshape(cache[&quot;hf&quot;].shape)
+
+    for l in reversed(range(L)):
+        lc = cache[&quot;layers&quot;][l]
+        # 前馈支路：y = act @ w2 + b2
+        dy = dx
+        g[f&quot;w2{l}&quot;] += lc[&quot;act&quot;].reshape(-1, F).T @ dy.reshape(-1, D)
+        g[f&quot;b2{l}&quot;] += dy.reshape(-1, D).sum(0)
+        du = gelu_backward(dy @ p[f&quot;w2{l}&quot;].T, lc[&quot;u&quot;], lc[&quot;gelu_t&quot;])
+        g[f&quot;w1{l}&quot;] += lc[&quot;b&quot;].reshape(-1, D).T @ du.reshape(-1, F)
+        g[f&quot;b1{l}&quot;] += du.reshape(-1, F).sum(0)
+        dln2, g[f&quot;ln2g{l}&quot;], g[f&quot;ln2b{l}&quot;] = layer_norm_backward(
+            (du @ p[f&quot;w1{l}&quot;].T).reshape(-1, D), lc[&quot;bhat&quot;].reshape(-1, D),
+            lc[&quot;brstd&quot;].reshape(-1, 1), p[f&quot;ln2g{l}&quot;])
+        dx = dy + dln2.reshape(dy.shape)      # 残差：两条支路相加
+
+        # 注意力支路：o = concat(heads) @ wo
+        do = dx
+        cat = np.concatenate([lc[&quot;att&quot;][:, h] @ lc[&quot;v&quot;][:, :, h * DH:(h + 1) * DH]
+                              for h in range(H)], -1)
+        g[f&quot;wo{l}&quot;] += cat.reshape(-1, D).T @ do.reshape(-1, D)
+        docat = do @ p[f&quot;wo{l}&quot;].T
+        dq, dk, dv = np.zeros_like(lc[&quot;q&quot;]), np.zeros_like(lc[&quot;k&quot;]), np.zeros_like(lc[&quot;v&quot;])
+        for h in range(H):
+            sl = slice(h * DH, (h + 1) * DH)
+            at, douth = lc[&quot;att&quot;][:, h], docat[:, :, sl]
+            dp = douth @ lc[&quot;v&quot;][:, :, sl].transpose(0, 2, 1)
+            dv[:, :, sl] = at.transpose(0, 2, 1) @ douth
+            ds = at * (dp - (dp * at).sum(-1, keepdims=True))   # softmax 反向
+            dq[:, :, sl] = ds @ lc[&quot;k&quot;][:, :, sl] / math.sqrt(DH)
+            dk[:, :, sl] = ds.transpose(0, 2, 1) @ lc[&quot;q&quot;][:, :, sl] / math.sqrt(DH)
+        g[f&quot;wq{l}&quot;] += lc[&quot;a&quot;].reshape(-1, D).T @ dq.reshape(-1, D)
+        g[f&quot;wk{l}&quot;] += lc[&quot;a&quot;].reshape(-1, D).T @ dk.reshape(-1, D)
+        g[f&quot;wv{l}&quot;] += lc[&quot;a&quot;].reshape(-1, D).T @ dv.reshape(-1, D)
+        da = dq @ p[f&quot;wq{l}&quot;].T + dk @ p[f&quot;wk{l}&quot;].T + dv @ p[f&quot;wv{l}&quot;].T
+        dln1, g[f&quot;ln1g{l}&quot;], g[f&quot;ln1b{l}&quot;] = layer_norm_backward(
+            da.reshape(-1, D), lc[&quot;xhat&quot;].reshape(-1, D),
+            lc[&quot;rstd&quot;].reshape(-1, 1), p[f&quot;ln1g{l}&quot;])
+        dx = dx + dln1.reshape(da.shape)
+
+    np.add.at(g[&quot;wte&quot;], cache[&quot;ids&quot;], dx)          # token id 会重复，必须累加
+    g[&quot;wpe&quot;][:cache[&quot;ids&quot;].shape[1]] += dx.sum(0)
+    return g</code></pre>
+<p>④ 训练循环与生成</p>
+<pre><code class="language-python"># ---------------------------------------------------------------- 6. 训练
+def train(steps=12000, batch=16, lr=6e-3, warmup=200):
+    p = init_params(rng)
+    m = {k: np.zeros_like(v) for k, v in p.items()}
+    vv = {k: np.zeros_like(v) for k, v in p.items()}
+    b1, b2, eps = 0.9, 0.99, 1e-8
+    losses = []
+    for step in range(1, steps + 1):
+        # 随机截一段语料，输入 ids，标签是 ids 右移一位
+        ix = rng.integers(0, len(data) - T - 1, size=batch)
+        ids = np.stack([data[i:i + T] for i in ix])
+        targets = np.stack([data[i + 1:i + 1 + T] for i in ix])
+
+        logits, cache = forward(p, ids, keep=True)
+        lg = logits - logits.max(-1, keepdims=True)
+        logp = lg - np.log(np.exp(lg).sum(-1, keepdims=True))
+        loss = -np.take_along_axis(logp, targets[..., None], -1).mean()
+        losses.append(float(loss))
+
+        # 交叉熵对 logits 的梯度就是 p - 1[y]
+        dlogits = np.exp(logp)
+        np.put_along_axis(dlogits, targets[..., None],
+                          np.take_along_axis(dlogits, targets[..., None], -1) - 1.0, -1)
+        dlogits /= ids.size
+        grads = backward(p, cache, dlogits)
+
+        lr_t = lr * min(1.0, step / warmup) * \
+               (0.5 * (1 + math.cos(math.pi * min(1.0, step / steps))) * 0.9 + 0.1)
+        for k in p:                                   # Adam
+            m[k] = b1 * m[k] + (1 - b1) * grads[k]
+            vv[k] = b2 * vv[k] + (1 - b2) * grads[k] ** 2
+            mhat = m[k] / (1 - b1 ** step)
+            vhat = vv[k] / (1 - b2 ** step)
+            p[k] -= lr_t * mhat / (np.sqrt(vhat) + eps)
+        if step % 250 == 0 or step == steps:
+            print(f&quot;step {step:5d}  loss {np.mean(losses[-250:]):.4f}&quot;, flush=True)
+    return p
+
+# ---------------------------------------------------------------- 7. 生成
+def sample(p, text, n=60, temp=0.8):
+    s = text
+    for _ in range(n):
+        ids = np.array([[STOI[c] for c in s[-T:]]])
+        lg = forward(p, ids)[0, -1] / temp
+        nxt = int(rng.choice(V, p=softmax(lg)))
+        s += ITOS[nxt]
+        if s.endswith(&quot;. &quot;) and len(s) &gt; len(text) + 8:
+            break
+    return s
+
+if __name__ == &quot;__main__&quot;:
+    p = train()
+    for prompt in [&quot;the cat &quot;, &quot;the dog sat on the &quot;, &quot;a man &quot;]:
+        print(repr(sample(p, prompt)))</code></pre>
+<h2>三段最值得盯住的代码</h2>
+<p><strong>第一，权重共享输出头。</strong><code>logits = hf @ p["wte"].T</code>。输出层没有独立参数：token 嵌入矩阵转置一下就当分类器用。这样 17×8 的矩阵既是"输入的查表"又是"输出的打分表"，参数省一半（GPT-2、Llama 都这么做）。代价是 <code>wte</code> 的梯度来自两处——反向开头那份来自 logits，结尾 <code>np.add.at</code> 那份来自嵌入——必须相加。</p>
+<p><strong>第二，softmax 的反向。</strong>正向是 <code>at = softmax(sc)</code>，反向只有一行：</p>
+<div class="equation"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.2074em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord mathnormal">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2074em;vertical-align:-0.836em;"></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord mathnormal">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.7852em;vertical-align:-1.4138em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4138em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord mathnormal">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9721em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mord">19.1</span></span></span></span></span></div>
+<p>写成代码就是 <code>ds = at <em> (dp - (dp </em> at).sum(-1))</code>。注意括号里那项必须沿<strong>同一行</strong>求和（<code>axis=-1</code>），因为 softmax 是在"这一行所有 key 的分数"之间做的归一化。</p>
+<p><strong>第三，LayerNorm 的反向。</strong>正向是 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">μ</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span></span></span></span>，但 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> 同时影响 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span></span></span></span> 和 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span></span></span></span>，所以反向有三条路径汇合：</p>
+<div class="equation"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord mathnormal">d</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">mean</span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">mean</span></span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⊙</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mord">19.2</span></span></span></span></span></div>
+<p>代码里没有直接写这一行，而是用 <code>dvar</code> 与 <code>dmu</code> 两个中间量把它展开——两种写法等价，后者少做两次归约。作者第一版把 <code>dvar</code> 的系数写成了 <code>rstd<strong>3</code>（正确是 <code>rstd</strong>2</code>），结果训练损失卡在 3.2 不动；用数值梯度一查，只有这一项相对误差 17，其余全是 1e-7 量级。</p>
+<h2>怎么确认自己写对了：数值梯度</h2>
+<p>手写反向最大的风险是"看起来能训、其实是错的"。最可靠的验收方式是数值梯度：对每个参数扰动一点点，用损失的变化率逼近导数。</p>
+<div class="equation"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord mathnormal">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.113em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.03785em;">δ</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.03785em;">δ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">L</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.03785em;">δ</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord">19.3</span></span></span></span></span></div>
+<p>取 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03785em;">δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span>，随机抽查每个参数的 12 个分量，计算相对误差。健康的值应该在 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">7</span></span></span></span></span></span></span></span></span></span></span></span> 到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span></span> 之间；如果某个参数到 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></span> 以上，说明那一项的链式法则写错了。<code>toy_gpt.py</code> 里的实测结果：</p>
+<p><strong>梯度校验（tools/toy_gpt.py 的 grad_check）</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>抽查方式</td><td>每个参数矩阵随机抽 12 个分量，中心差分 δ=1e-5</td></tr><tr><td>最差相对误差</td><td>3.01e-07 （修复 LayerNorm bug 之前是 17.6）</td></tr><tr><td>结论</td><td>解析梯度与数值梯度在浮点精度内一致</td></tr></tbody></table></div>
+<blockquote><p><strong>三个真实踩过的坑</strong></p>
+<p><strong>1. LayerNorm 的 dvar 系数。</strong>推导时容易把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span> 和 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> 搞混，写错后损失不降但也不报错。 <strong>2. 重复 token 的嵌入梯度。</strong>一句话里同一个字符出现多次时，<code>g["wte"][ids] += dx</code> 只会保留最后一次写入（NumPy 花式索引不累加），必须用 <code>np.add.at</code>。 <strong>3. 因果掩码的位置。</strong>掩码要在 softmax <strong>之前</strong>加（加 -1e9 使其概率趋近 0），加在之后等于没加。</p></blockquote>
+<h2>跑起来是什么样</h2>
+<p>训练 12000 步、batch 16、学习率 6e-3 余弦衰减，损失从 3.5 降到 0.16 左右。温度 0.8 采样几个开头：</p>
+<pre><code class="language-text">step   250  loss 2.1043
+step  2000  loss 0.3494
+step  6000  loss 0.1873
+step 12000  loss 0.1600
+
+&quot;the cat &quot;                → &quot;the cat sat on the log.&quot;
+&quot;the dog sat on the &quot;     → &quot;the dog sat on the mat.&quot;
+&quot;a man &quot;                  → &quot;a man sat on the log.&quot;</code></pre>
+<p>它没有"理解"任何东西，只是把 775 个字符的统计规律压进了 1608 个参数里。但这套机制——查表、注意力、残差、归一化、softmax、交叉熵、反向传播——和你手机里那个千亿参数的模型完全同构，只是规模差了八个数量级。</p>
+<h2>从 200 行到 2000 行：还缺什么</h2>
+<div class="tablewrap"><table><thead><tr><th>能力</th><th>玩具版的做法</th><th>生产版的做法</th></tr></thead><tbody><tr><td>词表</td><td>17 个字符</td><td>10 万级 BPE，含多语言与代码</td></tr><tr><td>位置编码</td><td>可学习绝对位置</td><td>RoPE（第 4 章）</td></tr><tr><td>注意力</td><td>MHA，2 头</td><td>GQA/MQA + FlashAttention（第 10 章）</td></tr><tr><td>归一化</td><td>LayerNorm</td><td>RMSNorm，无 bias</td></tr><tr><td>前馈</td><td>GELU MLP</td><td>SwiGLU + MoE（第 7 章）</td></tr><tr><td>精度</td><td>float64</td><td>BF16 前向 + FP32 主权重</td></tr><tr><td>并行</td><td>无</td><td>DP/TP/PP/ZeRO（第 17 章）</td></tr><tr><td>推理</td><td>每次重算全序列</td><td>KV cache + 连续批处理（第 10 章）</td></tr></tbody></table></div>
+<blockquote><p><strong>小结</strong></p>
+<p>一个语言模型拆开来看就是"查表 → 若干次（注意力 → 前馈）→ 打分"，前向和反向都能手写；手写的反向必须用数值梯度验收，否则错了也看不出来。规模改变的是工程，不是原理——第 22 章把规模带来的现象和常见误解收个尾。</p></blockquote>
+  <div class="pager"><a href="18-reasoning.html">← 推理模型：让模型多想一想</a><a href="20-agent.html" style="text-align:right">Agent：让模型动手做事 →</a></div>
+</main>
+</div>
+</body>
+</html>

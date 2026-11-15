@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>完整前向：从字符到概率 · 大模型是怎么想出一个字的</title>
+<link rel="stylesheet" href="katex.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav>
+  <div class="brand">LLM · From Scratch</div>
+  <a href="index.html">目录与说明</a>
+  <a href="00-hero.html">00 · 怎么读这份材料</a>
+  <a href="01-overview.html">01 · 全景：一次推理的七个阶段</a>
+  <a href="02-math.html">02 · 必备数学：只有六件事</a>
+  <a href="03-tokenizer.html">03 · 分词：把文字变成整数</a>
+  <a href="04-embedding.html">04 · 嵌入：把整数变成向量</a>
+  <a href="05-attention.html">05 · 注意力：20 个位置怎么互相看</a>
+  <a href="06-residual-norm.html">06 · 残差与归一化：让 96 层也能训</a>
+  <a href="07-ffn.html">07 · 前馈网络：模型把知识存在哪</a>
+  <a href="08-forward-pass.html" class="on">08 · 完整前向：从字符到概率</a>
+  <a href="09-sampling.html">09 · 选哪个字：温度、top-k、top-p</a>
+  <a href="10-inference-engine.html">10 · 推理引擎：把 FLOPs 变成毫秒</a>
+  <a href="11-kv-cache.html">11 · KV cache：显存、带宽与并发</a>
+  <a href="12-serving-params.html">12 · 服务参数：vLLM 与 SGLang 调参</a>
+  <a href="13-gpu.html">13 · GPU 执行：一次 decode 是怎么落到硬件上的</a>
+  <a href="14-quant-spec.html">14 · 推理加速：量化、投机解码与约束解码</a>
+  <a href="15-long-context.html">15 · 长上下文：位置外推、KV 压缩与 1M 的账</a>
+  <a href="16-arch-variants.html">16 · 架构变体：MoE、MLA、Mamba 与 MTP</a>
+  <a href="17-training.html">17 · 训练：从下一个字到对齐人类</a>
+  <a href="18-reasoning.html">18 · 推理模型：让模型多想一想</a>
+  <a href="19-implement.html">19 · 从零实现：200 行 numpy</a>
+  <a href="20-agent.html">20 · Agent：让模型动手做事</a>
+  <a href="21-harness.html">21 · Harness：模型外面那一圈代码</a>
+  <a href="22-scale-faq.html">22 · 规模地图与常见误解</a>
+  <a href="23-exercises.html">23 · 习题与动手实验</a>
+  <a href="24-glossary.html">24 · 术语表</a>
+  <a href="25-source-reading.html">25 · 源码导读：读一个真实的注意力 kernel</a>
+  <a href="26-research-frontier.html">26 · 研究前沿：推理引擎正在往哪走</a>
+  <a href="book.html">合集（单页）</a>
+</nav>
+<main>
+  <div class="crumb">第八章 · 完整前向</div>
+  <h1>完整前向：从字符到概率</h1>
+<p>零件齐了。这一章把它们装起来，从字符串 <code>the cat sat on the m</code> 出发，一路算到最后输出的概率分布。每一行都是这个训练好的小模型的真实输出，不是示意。读完这一章，你应该能在纸上把任意一个 token 的前向过程复现出来。</p>
+<h2>第 0 步：字符串变成矩阵</h2>
+<p>分词器把这 20 个字符映射成 20 个整数（字符级，每个字符一个 token）：</p>
+<p><code>t</code></p>
+<p><code>h</code></p>
+<p><code>e</code></p>
+<p><code>␣</code></p>
+<p><code>c</code></p>
+<p><code>a</code></p>
+<p><code>t</code></p>
+<p><code>␣</code></p>
+<p><code>s</code></p>
+<p><code>a</code></p>
+<p><code>t</code></p>
+<p><code>␣</code></p>
+<p><code>o</code></p>
+<p><code>n</code></p>
+<p><code>␣</code></p>
+<p><code>t</code></p>
+<p><code>h</code></p>
+<p><code>e</code></p>
+<p><code>␣</code></p>
+<p><code>m</code></p>
+<p><strong>输入整理</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>ids</td><td>[15, 7, 5, 0, 3, 2, 15, 0, 14, 2, 15, 0, 12, 11, 0, 15, 7, 5, 0, 10]</td></tr><tr><td>嵌入 + 位置</td><td>X = wte[ids] + wpe[0:20] <code>[20, 8]</code></td></tr><tr><td>我们只跟踪最后一行</td><td>位置 19（字符 m）的 x = [−1.5651, 0.8432, 0.6085, −0.8543, 0.5743, 0.6986, 1.0881, −0.2305]</td></tr></tbody></table></div>
+<p>其余 19 行形状完全相同，也各自带着自己的内容。下面的每一步都同时作用在 20 行上，但为了看得清，我们只打印第 19 行。</p>
+<h2>第 1 层</h2>
+<p><strong>① 归一化 + 投影出 Q / K / V。</strong>20 行都要做，第 19 行得到：</p>
+<p><strong>第 1 层 · LN 与 QKV</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>LN(x) = a</td><td>[−2.2215, 1.1554, 0.4807, −1.6514, 0.1775, 0.5562, 1.5788, −0.3015]</td></tr><tr><td>q = a·W_Q</td><td>[1.2184, 1.7456, 1.3819, 0.4668 \</td><td>0.4338, 0.6030, −1.0351, 2.6107]</td></tr><tr><td>k = a·W_K</td><td>[−1.2277, −2.9444, −1.0647, 0.4709 \</td><td>−1.0433, −1.1363, 0.0758, 0.0491]</td></tr><tr><td>v = a·W_V</td><td>[−0.4326, −2.2233, 0.8966, −0.5234 \</td><td>−1.7925, 0.4292, 0.6777, −0.0663]</td></tr></tbody></table></div>
+<p><strong>② 两个头各自打分、softmax、加权求和。</strong>head 0 的权重（第 5 章算过）集中在第 18 位空格（33.5%）和第 16 位 h（21.8%），head 1 集中在第 12 位 o（18.5%）。两头的输出拼起来再乘 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">O</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：</p>
+<p><strong>第 1 层 · 注意力输出</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>head 0</td><td>[0.1115, 0.4045, −0.0704, 0.1114]</td></tr><tr><td>head 1</td><td>[−0.0616, 0.4743, 0.4286, −0.2777]</td></tr><tr><td>concat·W_O = o</td><td>[−0.0850, −0.0369, 0.2465, −0.1577, 0.1771, 0.1589, −0.4437, 0.5405]</td></tr></tbody></table></div>
+<p><strong>③ 残差相加。</strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span>：</p>
+<p><strong>第 1 层 · 残差 1</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>x₁</td><td>[−1.6501, 0.8063, 0.8550, −1.0120, 0.7514, 0.8575, 0.6444, 0.3099]</td></tr></tbody></table></div>
+<p><strong>④ 前馈网络。</strong><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">LN</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord mathnormal">b</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord"><span class="mord mathrm">act</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">GELU</span></span><span class="mopen">(</span><span class="mord mathnormal">u</span><span class="mclose">)</span></span></span></span>，<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathrm">act</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>：</p>
+<p><strong>第 1 层 · 前馈网络</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>b <code>[8]</code></td><td>[−2.4641, 0.7416, 0.6498, −1.5981, 0.5259, 0.6144, 0.1019, 0.1396]</td></tr><tr><td>u <code>[16]</code></td><td>[2.9289, −0.1383, −0.4472, −0.2923, −0.8060, −1.1141, −0.0076, −0.2453, −1.3510, 1.7941, 0.2537, −0.8691, −4.1551, −0.5081, −3.0533, 1.8288]</td></tr><tr><td>act <code>[16]</code></td><td>[2.9243, −0.0615, −0.1464, −0.1125, −0.1694, −0.1479, −0.0038, −0.0989, −0.1196, 1.7287, 0.1522, −0.1673, −0.0000, −0.1553, −0.0031, 1.7671]</td></tr><tr><td>y <code>[8]</code></td><td>[1.4417, −3.0897, −0.8570, −1.7572, −0.6499, −1.9208, 1.0026, 0.0291]</td></tr><tr><td>x₂ = x₁ + y</td><td>[−0.2084, −2.2835, −0.0020, −2.7692, 0.1014, −1.0633, 1.6470, 0.3390]</td></tr></tbody></table></div>
+<p>第 1 层结束。x₂ 就是第 2 层的输入。</p>
+<h2>第 2 层</h2>
+<p>第 2 层做一模一样的事，只是参数换了一套。下面把全部关键中间量一次列完：</p>
+<p><strong>第 2 层 · 全部中间量（位置 19）</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>x <code>[8]</code></td><td>[−0.2084, −2.2835, −0.0020, −2.7692, 0.1014, −1.0633, 1.6470, 0.3390]</td></tr><tr><td>LN(x) = a₂</td><td>[0.1298, −1.6306, 0.5306, −1.9383, 0.4867, −0.3695, 1.0776, 0.5422]</td></tr><tr><td>q</td><td>[−0.2474, 0.0026, 0.0293, −1.1099 \</td><td>0.0573, 2.7656, 1.8566, −0.3663]</td></tr><tr><td>注意力输出 o</td><td>[1.2237, 0.4214, 0.9607, −0.2183, 0.3269, 0.2796, −0.6468, −2.7025]</td></tr><tr><td>x₁ = x + o</td><td>[1.0153, −1.8621, 0.9587, −2.9875, 0.4284, −0.7836, 1.0002, −2.3634]</td></tr><tr><td>b = LN(x₁)</td><td>[2.2577, −1.1674, 1.6258, −1.5533, 0.1593, −0.7389, 0.7846, −1.7749]</td></tr><tr><td>u <code>[16]</code></td><td>[−4.0368, −1.6039, −1.0477, −2.8961, −1.3404, 1.4847, −2.6753, −1.3064, 5.6561, −2.4380, −0.1257, −3.1186, 1.2644, 3.3244, 0.7133, 0.0748]</td></tr><tr><td>act</td><td>[−0.0001, −0.0874, −0.1546, −0.0050, −0.1209, 1.3823, −0.0095, −0.1253, 5.6561, −0.0176, −0.0566, −0.0025, 1.1339, 3.3232, 0.5436, 0.0396]</td></tr><tr><td>y</td><td>[0.0544, 2.4397, −8.7410, 1.5465, −0.5822, −1.5382, 2.8947, 0.3074]</td></tr><tr><td>x₂ = x₁ + y</td><td>[1.0697, 0.5776, −7.7823, −1.4410, −0.1538, −2.3218, 3.8949, −2.0561]</td></tr></tbody></table></div>
+<p>第 2 层的注意力输出明显比第 1 层大（模长 3.3 对 0.8），前馈输出也更大。层越深，模型越"敢"改写表示。</p>
+<h2>最后一步：投影到 17 个候选</h2>
+<p>先把 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> 归一化，再过输出层：</p>
+<p><strong>输出前的 LN 与 logits</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>LN(x₂) = x̂</td><td>[0.6608, 0.5057, −2.1297, −0.1306, 0.2751, −0.4083, 1.5515, −0.3245]</td></tr><tr><td>× γ_final</td><td>γ = [4.223, 5.030, 4.828, 4.877, 3.527, 6.170, 5.858, 4.766]</td></tr><tr><td>最终隐藏状态 hf <code>[8]</code></td><td>[2.6092, 2.0342, −10.3805, −0.3596, 1.2691, −2.4863, 10.1429, −0.9678]</td></tr><tr><td>logits = hf·Wᵀ <code>[17]</code></td><td>输出层与词嵌入共享同一个矩阵（weight tying）：第 i 个候选的分数就是 hf 与该字符嵌入的点积</td></tr></tbody></table></div>
+<p>以字符 <strong>a</strong> 为例，它的嵌入是 <strong>a</strong> 那一行（<code>wte[2]</code>），分数是 8 个乘积之和：</p>
+<p><strong>logit(a) 的逐项分解</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>wte[a]</td><td>[0.1452, −1.0965, −1.0106, 0.1121, −0.0511, −0.1663, 1.6555, 0.3449]</td></tr><tr><td>hf ⊙ wte[a]</td><td>[0.3789, −2.2306, 10.4905, −0.0403, −0.0648, 0.4135, 16.7918, −0.3337]</td></tr><tr><td>求和</td><td>25.4052 其中第 6 维（hf=10.14，嵌入=1.66）一个人贡献了 16.79</td></tr></tbody></table></div>
+<p>17 个候选各算一次点积，得到 17 个分数：</p>
+<div class="tablewrap"><table><thead><tr><th>字符</th><th>logit</th><th>概率</th><th>字符</th><th>logit</th><th>概率</th></tr></thead><tbody><tr><td><strong>a</strong></td><td>25.4052</td><td><strong>0.99865</strong></td><td>w</td><td>18.3722</td><td>0.00088</td></tr><tr><td>.</td><td>17.7327</td><td>0.00046</td><td>d</td><td>13.1847</td><td>0.000005</td></tr><tr><td>l</td><td>11.8495</td><td>0.000001</td><td>h</td><td>10.7323</td><td>≈0</td></tr><tr><td>r</td><td>10.1155</td><td>≈0</td><td>i</td><td>8.6264</td><td>≈0</td></tr><tr><td>␣</td><td>5.8092</td><td>≈0</td><td>s</td><td>4.9165</td><td>≈0</td></tr><tr><td>t</td><td>3.9968</td><td>≈0</td><td>n</td><td>1.4543</td><td>≈0</td></tr><tr><td>m</td><td>−0.0546</td><td>≈0</td><td>c</td><td>−5.3888</td><td>≈0</td></tr><tr><td>o</td><td>−11.5926</td><td>≈0</td><td>e</td><td>−12.1840</td><td>≈0</td></tr><tr><td>g</td><td>−15.3888</td><td>≈0</td><td></td><td></td><td></td></tr></tbody></table></div>
+<p>softmax 之后，第一名拿到 99.87%，第二名 w 只有 0.09%。这个分布非常"自信"——因为训练充分、句子又高度刻板。</p>
+<h2>算损失：模型有多惊讶</h2>
+<p>真实的下一个字符是 <strong>a</strong>。交叉熵损失就是"给正确答案分配的概率的负对数"：</p>
+<div class="equation"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">ln</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord text"><span class="mord">a</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">ln</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.99865</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.00135</span><span class="mspace" style="margin-right:2em;"></span><span class="mopen">(</span><span class="mord">8.1</span><span class="mclose">)</span></span></span></span></span></div>
+<p>这个位置上模型几乎不感到惊讶。但整句话不是每个位置都这么好猜。20 个位置各自的损失：</p>
+<p><strong>20 个位置的损失</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>逐位置</td><td>[0.874, 0.001, 0.000, 3.116, 0.000, 0.000, 0.323, 0.567, 0.000, 0.000, 0.651, 0.033, 0.016, 0.000, 0.000, 0.000, 0.000, 0.000, 0.854, 0.001]</td></tr><tr><td>平均</td><td>0.3218 （训练时报告的是 0.182，那是整个 batch 的平均）</td></tr><tr><td>最难的位置</td><td>第 4 个位置（刚打完 "the "，它更想接 m 或 l）偏要接 c，损失 3.12；第 1 个位置预测 h 损失 0.87；第 19 个位置（空格）在 l/m 之间犹豫，损失 0.85</td></tr></tbody></table></div>
+<p>注意第 18 位（<code>the cat sat on the ␣</code>）：模型在 "l"（0.569）和 "m"（0.426）之间犹豫，因为语料里 "on the log" 和 "on the mat" 都出现过。到第 19 位拿到 "m" 之后，它立刻确定下一个是 "a"。这正是自回归生成的样子：<strong>每多一个字符，不确定性就塌缩一次</strong>。</p>
+<h2>形状总账</h2>
+<div class="tablewrap"><table><thead><tr><th>阶段</th><th>张量</th><th>形状</th><th>参数量</th></tr></thead><tbody><tr><td>输入</td><td>ids</td><td>[20]</td><td>—</td></tr><tr><td>嵌入</td><td>X = wte[ids] + wpe</td><td>[20, 8]</td><td>136 + 320</td></tr><tr><td>每层 · LN1</td><td>a</td><td>[20, 8]</td><td>16</td></tr><tr><td>每层 · QKV</td><td>q, k, v</td><td>各 [20, 8]</td><td>3 × 64</td></tr><tr><td>每层 · 注意力</td><td>scores / weights</td><td>[2, 20, 20]</td><td>0</td></tr><tr><td>每层 · 输出投影</td><td>o</td><td>[20, 8]</td><td>64</td></tr><tr><td>每层 · FFN</td><td>u / act / y</td><td>[20,16] / [20,16] / [20,8]</td><td>280</td></tr><tr><td>输出</td><td>logits → probs</td><td>[20, 17]</td><td>0（共享 wte）</td></tr></tbody></table></div>
+<h2>这一趟花了多少计算</h2>
+<p>粗略地，一次前向的浮点运算量约等于 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mord">×</span></span></span></span> 参数量 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">×</span></span></span></span> token 数。本模型：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1608</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6.4</span></span></span></span> 万次浮点运算。同样的公式用在 GPT-3 上：<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1750</span></span></span></span> 亿 <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">×</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3500</span></span></span></span> 亿次——<strong>每生成一个 token</strong>。</p>
+<p><strong>横向对比：生成一个 token 的计算量</strong></p>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>本页小模型</td><td>2 × 1608 ≈ 3.2 千 FLOPs</td></tr><tr><td>Llama 3 8B</td><td>2 × 8.0e9 ≈ 16 GFLOPs</td></tr><tr><td>GPT-3 175B</td><td>2 × 1.75e11 ≈ 350 GFLOPs</td></tr><tr><td>一张 H100（FP16）</td><td>约 990 TFLOPS 峰值，跑 350 GFLOPs 理论上 0.35 毫秒；实际受显存带宽限制，通常几十毫秒</td></tr></tbody></table></div>
+<blockquote><p><strong>小结</strong></p>
+<p>一个 token 的生成 = 一行 8 维向量，穿过 2 个"注意力 + 前馈"块，每一次都被加上一个增量、每隔一步被归一化，最后点乘 17 个字符嵌入得到分数，softmax 成概率。大模型做的是完全相同的事，只是把 8 换成 4096、2 层换成 32 层、17 个字符换成 12.8 万个 token。</p></blockquote>
+<blockquote><p><strong>下一章</strong></p>
+<p>概率分布已经算出来了，但"选哪个"是另一个问题。贪心地选最大概率会得到重复、死板的文本；按概率随机抽又可能抽到离谱的词。温度、top-k、top-p 就是在调这个旋钮。</p></blockquote>
+  <div class="pager"><a href="07-ffn.html">← 前馈网络：模型把知识存在哪</a><a href="09-sampling.html" style="text-align:right">选哪个字：温度、top-k、top-p →</a></div>
+</main>
+</div>
+</body>
+</html>
